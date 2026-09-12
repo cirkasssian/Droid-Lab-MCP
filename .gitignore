@@ -1,0 +1,37 @@
+# Android project
+app/
+build/
+.gradle/
+build.gradle.kts
+settings.gradle.kts
+gradle.properties
+gradle/
+gradlew
+local.properties
+
+# Test artifacts
+*.jpg
+*.png
+.playwright-mcp/
+# ...but the README demo image is source, not an artifact
+!docs/*.png
+
+# Python cache (web/bridge.py)
+__pycache__/
+
+# npm artifacts: the root package.json carries all deps; web/ has no package.json
+web/package-lock.json
+npm
+
+# IDE
+.codegraph/
+.omo/
+.opencode/
+# machine-specific config (absolute path to mcp/server.mcp.mjs)
+opencode.json
+
+# OS
+.DS_Store
+node_modules/
+shots/
+pulled/

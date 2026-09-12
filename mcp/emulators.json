@@ -1,0 +1,21 @@
+[
+  {
+    "name": "android-13",
+    "avd": "API33"
+  },
+  {
+    "name": "android-15",
+    "avd": "API35",
+    "note": "google_apis/x86_64"
+  },
+  {
+    "name": "android-14",
+    "avd": "API34",
+    "note": "google_apis/x86_64"
+  },
+  {
+    "name": "android-11",
+    "avd": "API30",
+    "note": "google_apis/x86_64"
+  }
+]

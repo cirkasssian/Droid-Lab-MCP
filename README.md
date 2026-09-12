@@ -1,0 +1,268 @@
+# DroidLab MCP
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A518-green)](https://nodejs.org)
+[![MCP](https://img.shields.io/badge/protocol-MCP-blue)](https://modelcontextprotocol.io)
+
+**Android emulator under full control of an AI agent.** DroidLab is an MCP (Model Context Protocol) server that lets any MCP client — Claude Desktop, OpenCode, Cursor, a custom agent — boot an Android emulator, drive its UI (tap / swipe / type / keys), read the screen (screenshot + UI element tree), install APKs, read logs, and use the clipboard. While the agent works, a human can watch the live screen in a regular browser over the local network.
+
+> **Agent first.** The MCP server is the product; the browser is the observation deck. An agent can set up and use the entire toolset without any human in the loop.
+
+```
+[MCP client / agent] ──stdio──> [MCP server] ──adb──> [Android emulator]
+                                     │
+[Browser / human] <──WebSocket──> [Node.js bridge] <──┘  (video + input relay)
+   H.264 via WebCodecs
+```
+
+![DroidLab browser UI: live Android screen, status header, navigation controls](docs/demo.png)
+
+## Table of contents
+
+- [Requirements](#requirements)
+- [Agent quick start](#agent-quick-start)
+- [Tools](#tools)
+- [Resources](#resources)
+- [Human quick start](#human-quick-start)
+- [Architecture](#architecture)
+- [Security model](#security-model)
+- [Configuration](#configuration)
+- [WebSocket protocol](#websocket-protocol)
+- [Latency model](#latency-model)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+## Requirements
+
+| Dependency | Notes |
+|---|---|
+| Node.js ≥ 18 | bridge + MCP server |
+| Android SDK | `emulator`, `platform-tools` (adb); `ANDROID_HOME` or default paths |
+| ffmpeg | WebP fallback path only |
+| Xvfb + xdotool | WebP fallback path only (Linux) |
+| scrcpy 4.x | H.264 stream + control channel; `~/bin/scrcpy/` by default |
+
+Linux, macOS and Windows are supported. The primary H.264 path works everywhere; the WebP fallback (browsers without WebCodecs) is Linux-only.
+
+## Agent quick start
+
+```bash
+git clone https://github.com/cirkasssian/Droid-Lab-MCP.git droidlab && cd droidlab
+npm install        # ws, @modelcontextprotocol/sdk, zod
+```
+
+Register the server in your MCP client (`opencode.json`, `claude_desktop_config.json`, …):
+
+```json
+{
+  "mcpServers": {
+    "droidlab": {
+      "command": "node",
+      "args": ["/absolute/path/to/droidlab/mcp/server.mcp.mjs"]
+    }
+  }
+}
+```
+
+A typical first session:
+
+1. `env_start` — boots Xvfb (Linux), the emulator (cold boot) and the bridge; blocks until Android is up.
+2. `screenshot` / `ui_dump` / `wait_for` — see the screen, locate elements by text or `resource-id`.
+3. `tap` / `swipe` / `text` / `key` — drive the UI in native pixels (default screen 1080×2400).
+4. `install_apk` / `push_file` / `pull_file` / `logcat` / `clipboard_get` — install and inspect.
+5. `access_start` — when a human needs to watch: returns a tokenized LAN URL.
+6. `env_stop` — shut everything down when done.
+
+All long operations (boot, image download, APK install, file transfer) support MCP cancellation (`notifications/cancelled`) and report progress (`notifications/progress`).
+
+> There is **no raw `adb shell` tool by design**: an arbitrary command is an injection vector and a bypass of tool annotations. The 33 tools below cover the needed surface.
+
+## Tools
+
+33 tools. Status tools (`env_status`, `device_state`, `env_list`, `system_images_list`) also return `structuredContent` (MCP 2025-06-18). All tools declare MCP annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`).
+
+### Lifecycle
+
+| Tool | Description |
+|---|---|
+| `env_start({avd?})` | Xvfb + emulator (cold boot, device state is lost on stop) + bridge on loopback. Idempotent (accepts an already-running external emulator), mutex-protected. |
+| `env_stop` | Graceful shutdown → verified kill → stale-lock removal. |
+| `env_status` | Processes (bridge/emulator/xvfb), boot state, device info, input mode. |
+| `env_list` | Entries of `mcp/emulators.json` + all AVDs discovered in the SDK. |
+| `reboot_emulator` | `adb reboot` with a boot wait (~120 s); app state is preserved. |
+| `adb_restart` | Restart the local adb server (kill-server + start-server) — for a wedged adb: device gone from `adb devices`, stuck `offline`/`unauthorized`, stale port-5037 server. Streams recover automatically; not a device reboot. |
+
+### SDK / AVD management
+
+| Tool | Description |
+|---|---|
+| `system_images_list` | Installed system images + ones available for download. |
+| `system_image_install({package})` | `sdkmanager --install` (30 min cap, cancellable, progress). |
+| `avd_create({name, package, alias?})` | `avdmanager create avd` (pixel_7 profile) + a record in `emulators.json`. |
+
+### Device interaction
+
+| Tool | Description |
+|---|---|
+| `screenshot` | Inline JPEG (720×1600) + full PNG saved to `shots/` + resource link. |
+| `ui_dump` | Tree of visible elements (class / text / resource-id / clickable / bounds + center in native pixels). XML saved to `shots/`. |
+| `wait_for({text?\|rid?\|desc?, timeout_ms?, interval_ms?})` | Server-side polling of the UI tree until an element appears; criteria combine with AND; returns ready-to-tap centers. |
+| `tap({x, y})` | Tap at native pixels. |
+| `swipe({x1, y1, x2, y2, ms?})` | Swipe; `ms=800` acts as a long press. |
+| `scroll({x, y, dy})` | Scroll at a point; `dy > 0` is down. |
+| `key({key})` | Named key (`home`, `back`, `recents`, `enter`, …) or a numeric keycode. |
+| `text({text})` | Type Unicode text (via ADBKeyBoard) into the focused field. |
+| `clipboard_get` / `clipboard_set({text, paste?})` | Read / write the device clipboard. |
+| `install_apk({path})` | `adb install -r -t`. |
+| `push_file({src, dst})` / `pull_file({src, dst?})` | File transfer with the device (cancellable). |
+| `open_app({package})` / `close_app({package})` | Launch via monkey / force-stop. |
+| `deep_link({uri, package?})` | VIEW intent: https links, app links, custom schemes. |
+| `app_permission({package, permission, grant})` | `pm grant/revoke` (manifest dangerous permissions only). |
+| `app_list({filter?, system?})` | List packages, optional substring filter, include system apps. |
+| `logcat({lines?, filter?, grep?})` | Snapshot of the device log with filters. |
+| `device_state` | Processes, boot, Android/API version, screen, foreground app, input mode. |
+| `set_resolution({name?}\|{list:true})` | Change the stream resolution (see [Latency model](#latency-model)). |
+
+### Network access (for humans)
+
+| Tool | Description |
+|---|---|
+| `access_start` | Bridge → `0.0.0.0`; returns a LAN URL with an access token. |
+| `access_stop` | Back to loopback; LAN access cut off. |
+| `set_dev_input({enabled})` | Grant / revoke browser input. |
+
+## Resources
+
+| URI | Content |
+|---|---|
+| `droidlab://state` | Current environment state (JSON) |
+| `droidlab://shots/latest` | Latest full-resolution screenshot (PNG) |
+| `droidlab://shots/{name}` | Any saved artifact: screenshots, UI dumps |
+
+## Human quick start
+
+Start the stack manually (or just ask the agent: *"start the emulator and let me watch"*):
+
+```bash
+# 1. Xvfb (Linux, WebP fallback only)
+Xvfb :99 -screen 0 1080x2400x24 &
+
+# 2. Emulator
+~/Android/Sdk/emulator/emulator -avd API33 -no-window -no-audio -no-snapshot &
+
+# 3. Bridge (starts scrcpy/ffmpeg on its own)
+node web/server.js
+```
+
+Open `http://<host>:8090` in a browser. The agent controls the stack over MCP and is the only party that opens network access (`access_start`) or unlocks browser input (`set_dev_input`).
+
+Headless machine? Tunnel instead of exposing the port:
+
+```bash
+ssh -L 8090:localhost:8090 user@headless -N
+# then: http://localhost:8090/?token=<accessToken>
+```
+
+Browser controls: click = tap, drag = swipe, wheel = scroll, keyboard = device input (printable text, Backspace, Enter, arrows, Esc), plus Back / Home / Recents / fullscreen buttons. APKs can be dragged into the window (`adb install -r -t`); other dropped files land in `/sdcard/Download/`. Ctrl+C / Ctrl+V bridge the host clipboard with the device.
+
+## Architecture
+
+| Component | Path | Purpose |
+|---|---|---|
+| MCP server | `mcp/server.mcp.mjs` | stdio server: emulator lifecycle, input, screenshots, access control |
+| Emulator config | `mcp/emulators.json` | Human-readable AVD names (`android-13` → `API33`) |
+| Web bridge | `web/server.js` | HTTP + WebSocket, scrcpy host (video + control), fallbacks, broadcast |
+| Frontend | `web/index.html` | Canvas rendering (WebCodecs / createImageBitmap), input, FPS |
+| Launcher | `web/bridge.py` | Runs `server.js` with millisecond logging |
+
+Primary video path — **raw scrcpy-server**, two instances per session:
+
+- a *video* instance (`control=false`) for the stream, and a *ctrl* instance (`video=false`) for input/clipboard — with `video=true` the server maps touch coordinates through the video frame and display pixels never arrive;
+- the bridge pushes `scrcpy-server.jar`, connects the sockets via `adb reverse localabstract:scrcpy_<scid>` and splits the stream into access units `[u64 pts_flags][u32 size]` (bit 62 = config, bit 61 = keyframe);
+- the browser decodes H.264 through WebCodecs `VideoDecoder`; the stream is content-driven (no frames on a static screen) and has no recording time limit.
+
+Fallbacks: `VIDEO_SRC=screenrecord` (180 s limit, auto-recycled at 170 s) and a WebP path (scrcpy → Xvfb → ffmpeg `x11grab`) for browsers without WebCodecs (`?codec=webp`).
+
+If the emulator dies, the bridge restores the stream automatically once the device is back.
+
+## Security model
+
+- **Tokens.** The bridge requires an access token (`WEB_ACCESS_TOKEN`, generated per bridge start): HTTP and WS without `?token=` get `401`. Browser input is gated by a separate `WEB_CONTROL_TOKEN`, so an observer cannot unlock input by itself. A manual start without `WEB_ACCESS_TOKEN` runs unauthenticated (trusted LAN only).
+- **Role separation.** The agent works through MCP; the developer watches (and taps only after `set_dev_input(true)`). While the agent works, browser input is blocked server-side.
+- **No shell injection surface.** No raw `adb shell` tool; the network surface is one port with token auth.
+
+## Configuration
+
+Environment variables (all optional):
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `8090` | Bridge port |
+| `HOST` | `0.0.0.0` (manual) / `127.0.0.1` (via MCP until `access_start`) | Bridge interface |
+| `WEB_ACCESS_TOKEN` | — | Bridge HTTP/WS token; without it access is open |
+| `WEB_CONTROL_TOKEN` | — | Input-control token; browser input disabled until `set_dev_input` |
+| `WEB_INPUT_ENABLED` | `1` | Manual start: `0` = observation mode |
+| `ADB` | per-OS SDK path | adb binary |
+| `FFMPEG` | `ffmpeg` | ffmpeg binary |
+| `SCRCPY` | `~/bin/scrcpy/*/scrcpy` | scrcpy binary (WebP fallback) |
+| `SCRCPY_SERVER` | `~/bin/scrcpy/*/scrcpy-server` | Server jar for the raw host |
+| `EMU_BIN` | SDK `emulator/emulator` | Emulator binary |
+| `EMU_AVD` | first entry of `mcp/emulators.json` | Default AVD |
+| `EMU_EXTRA_ARGS` | — | Extra emulator arguments |
+| `BOOT_TIMEOUT_MS` | `120000` | Boot wait limit |
+| `BRIDGE_PORT` | `8090` | Bridge port controlled by the MCP |
+| `VIDEO_SRC` | `scrcpy` | `screenrecord` = legacy H.264 path |
+| `ABR_RTT_MS` | `800` | RTT-probe downgrade threshold |
+| `ABR_UP_SECS` | `90` | Congestion-free seconds before an upgrade |
+| `ABR_DOWN_BYTES` | `600000` | WS backlog safety net for a downgrade |
+| `ABR_COOLDOWN_SECS` | `10` | Minimum interval between switches |
+| `ABR_CHECK_MS` | `2000` | Backlog check period |
+| `X_DISPLAY` | `:99` | X display for x11grab / scrcpy (WebP fallback) |
+
+End-to-end test: `npm run e2e:mcp` (boots the stack, exercises the toolset over real MCP stdio).
+
+## WebSocket protocol
+
+Client → server, the first message picks the codec:
+
+```json
+{"type":"init","codec":"h264"}
+```
+
+`h264` is selected automatically when `window.VideoDecoder` exists; force it with `?codec=h264` or `?codec=webp`.
+
+Input commands:
+
+```json
+{"type":"tap","x":540,"y":1200}
+{"type":"swipe","x1":540,"y1":10,"x2":540,"y2":1440,"ms":300}
+{"type":"key","code":4}
+{"type":"text","text":"hello"}
+```
+
+Server → client: binary frames `[1 byte flag][payload]` (bit 0 = keyframe for H.264 AUs, Annex-B; full WebP frames in fallback mode), `{"type":"res","name":"486x1080"}` on resolution changes, and a 1 Hz ping (RTT probe for ABR).
+
+## Latency model
+
+Resolution is managed automatically (ABR) from network throughput; the ladder is `324x720 → 486x1080`, `1004x2231` is available via API only.
+
+| Tier | H.264 encode | Bandwidth |
+|---|---|---|
+| 324x720 | 324x720 @3M | ~0.5 Mbit/s |
+| 486x1080 | 486x1080 @4M | ~2 Mbit/s |
+| 1004x2231 | encoded at 486x1080 | ~2 Mbit/s |
+
+The emulator's software encoder holds real-time only up to ~486×1080 when the emulator runs with software rendering (no hardware GPU passthrough), so the full tier is deliberately downscaled on both paths. Measured tap → visible change: ~120–400 ms (H.264), ~200 ms (WebP). Native 1080×2400 is not real-time with a software encoder (1.2–5 s) and is not used.
+
+A resolution switch does not flicker: the scrcpy video host restarts with the new `max_size` (the input channel stays up), the client resizes the canvas immediately, filters frames of the old size and covers the canvas until the first frame of the target size arrives.
+
+## Troubleshooting
+
+- **A system image does not boot** — some images are finicky about the host virtualization stack; if one fails to reach `sys.boot_completed`, try another API level (API 33 is a stable default; `emulators.json` carries per-AVD notes).
+- **Native H.264 (1080×2400) is not real-time** with a software-rendered emulator — by design, see [Latency model](#latency-model).
+- **`env_stop` waits up to 25 s** for a graceful emulator exit before a verified kill; SIGKILL mid-shutdown can wedge qemu in kernel D-state and leave stale AVD locks, which `env_start`/`env_stop` clean up themselves.
+- **Emulator killed externally** (e.g. by the OOM killer) — the bridge restores the stream after the emulator is back; restart it manually if needed.
+
+## License
+
+[MIT](LICENSE) © Shamil (cirkasssian)

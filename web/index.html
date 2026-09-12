@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Android Emulator — Web</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2334d058'/%3E%3Crect x='8' y='12' width='16' height='12' rx='3' fill='%23fff'/%3E%3Crect x='6' y='13' width='3' height='7' rx='1.5' fill='%23fff'/%3E%3Crect x='23' y='13' width='3' height='7' rx='1.5' fill='%23fff'/%3E%3Ccircle cx='13' cy='18' r='2' fill='%23111'/%3E%3Ccircle cx='19' cy='18' r='2' fill='%23111'/%3E%3Cpath d='M11 9 L13 6 M21 9 L19 6' stroke='%23fff' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
+  header { padding: 10px; font-size: 14px; opacity: .8; display: flex; align-items: center; gap: 12px; }
+  #resBadge { font-size: 13px; opacity: .75; font-variant-numeric: tabular-nums; }
+  #inputBadge {
+    font-size: 13px; color: #f0ad4e; border: 1px solid #f0ad4e;
+    border-radius: 10px; padding: 1px 8px; display: none;
+  }
+  #inputBadge.on { display: inline; }
+  #wrap { position: relative; }
+  canvas { max-width: 95vw; max-height: 78vh; box-shadow: 0 0 40px #000; cursor: crosshair; touch-action: none; }
+  #fsBtn {
+    position: absolute; top: 8px; right: 8px;
+    background: rgba(0,0,0,.5); color: #fff; border: 1px solid #555;
+    border-radius: 6px; padding: 6px 10px; font-size: 13px; cursor: pointer;
+    z-index: 10;
+  }
+  #fsBtn:hover { background: rgba(0,0,0,.7); }
+  #buttons { display: flex; gap: 16px; padding: 12px; align-items: center; }
+  .nav-btn {
+    background: none; border: none; cursor: pointer; padding: 8px;
+    opacity: .6; transition: opacity .15s;
+  }
+  .nav-btn:hover { opacity: 1; }
+  .nav-btn:active { transform: scale(.9); }
+  .nav-btn svg { display: block; }
+  body.fullscreen { overflow: hidden; }
+  body.fullscreen header { display: none; }
+  body.fullscreen canvas { max-width: 100vw; max-height: 100vh; width: 100vw; height: 100vh; object-fit: contain; }
+  body.fullscreen #wrap { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
+  body.fullscreen #fsBtn { top: 12px; right: 12px; }
+  body.fullscreen #buttons {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,.4); border-radius: 24px; padding: 4px 12px;
+  }
+  #overlay {
+    position: absolute; inset: 0;
+    background: #111;
+    display: none; align-items: center; justify-content: center;
+    z-index: 20; flex-direction: column; gap: 12px;
+    color: #fff; font-size: 14px;
+  }
+  #overlay.show { display: flex; }
+  .spinner {
+    width: 32px; height: 32px;
+    border: 3px solid #444; border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+  }
+  #fps { font-variant-numeric: tabular-nums; opacity: .7; font-size: 13px; min-width: 52px; text-align: right; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<header>
+  <span id="ver">Android …</span>
+  <span id="inputBadge" title="Input disabled — agent is controlling the device">👁 observation only</span>
+  <span id="resBadge" title="Resolution is adjusted automatically to network bandwidth">auto …</span>
+  <span id="fps">— fps</span>
+</header>
+<div id="wrap">
+  <canvas id="c" width="486" height="1080"></canvas>
+  <button id="fsBtn" title="Fullscreen">⛶</button>
+  <div id="overlay"><div class="spinner"></div><span>Switching resolution…</span></div>
+</div>
+<div id="buttons">
+  <button class="nav-btn" data-key="4" title="Back">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+  </button>
+  <button class="nav-btn" data-key="3" title="Home">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><circle cx="12" cy="12" r="7"/></svg>
+  </button>
+  <button class="nav-btn" data-key="187" title="Recents">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+  </button>
+</div>
+<script>
+const c = document.getElementById('c');
+const ctx = c.getContext('2d');
+const buttons = document.getElementById('buttons');
+const fsBtn = document.getElementById('fsBtn');
+const verEl = document.getElementById('ver');
+const fpsEl = document.getElementById('fps');
+let ws, frames = 0, switching = false, targetW = 0, targetH = 0, selName = '';
+const resMap = {};
+let devInput = true;
+const inputBadge = document.getElementById('inputBadge');
+function applyInputMode(enabled) {
+  devInput = enabled;
+  inputBadge.classList.toggle('on', !enabled);
+  c.style.cursor = enabled ? 'crosshair' : 'not-allowed';
+}
+
+const urlCodec = new URLSearchParams(location.search).get('codec');
+const mode = urlCodec === 'webp' ? 'webp' : (urlCodec === 'h264' || window.VideoDecoder) ? 'h264' : 'webp';
+
+// access token (MCP-managed bridge): page opened via a link of the form /?token=…
+const ACCESS_TOKEN = new URLSearchParams(location.search).get('token') || '';
+const withAuth = (url) => ACCESS_TOKEN
+  ? url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(ACCESS_TOKEN)
+  : url;
+const wsQuery = ACCESS_TOKEN ? '?token=' + encodeURIComponent(ACCESS_TOKEN) : '';
+
+let fpsCount = 0, fpsLast = performance.now();
+setInterval(() => {
+  const now = performance.now();
+  const fps = fpsCount * 1000 / Math.max(now - fpsLast, 1);
+  fpsEl.textContent = fps < 1 ? 'idle' : fps.toFixed(0) + ' fps';
+  fpsCount = 0;
+  fpsLast = now;
+}, 2000);
+
+fetch(withAuth('/version')).then(r => r.text()).then(v => {
+  verEl.textContent = `Android ${v}`;
+}).catch(() => { verEl.textContent = 'Android Emulator'; });
+
+// --- render: latest received frame, coalescing via rAF ---
+
+let pendingFrame = null, drawScheduled = false;
+
+function scheduleDraw() {
+  if (drawScheduled) return;
+  drawScheduled = true;
+  requestAnimationFrame(() => {
+    drawScheduled = false;
+    const src = pendingFrame;
+    pendingFrame = null;
+    if (!src) return;
+    const w = src.displayWidth || src.width;
+    const h = src.displayHeight || src.height;
+    if (targetW > 0) {
+      const ok = resMap[selName] && resMap[selName].okW.includes(w);
+      if (!ok) { src.close(); return; }
+    }
+    if (switching) {
+      switching = false;
+      targetW = 0; targetH = 0;
+      document.getElementById('overlay').classList.remove('show');
+    }
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    ctx.clearRect(0, 0, c.width, c.height);
+    ctx.drawImage(src, 0, 0);
+    src.close();
+    frames++;
+    fpsCount++;
+  });
+}
+
+function offerFrame(frameObj) {
+  if (pendingFrame) pendingFrame.close();
+  pendingFrame = frameObj;
+  scheduleDraw();
+}
+
+// --- WebP path: decoding off the main thread ---
+
+async function handleWebpFrame(u8) {
+  let bmp;
+  try { bmp = await createImageBitmap(new Blob([u8], { type: 'image/webp' })); }
+  catch { return; }
+  offerFrame(bmp);
+}
+
+// --- H.264 path: WebCodecs VideoDecoder ---
+
+let decoder = null, codecStr = '', needKey = true;
+
+function codecStringFromAU(au) {
+  for (let i = 0; i + 6 < au.length; i++) {
+    if (au[i] === 0 && au[i + 1] === 0 && au[i + 2] === 1 && (au[i + 3] & 0x1f) === 7) {
+      const hex = [au[i + 4], au[i + 5], au[i + 6]].map(b => b.toString(16).padStart(2, '0')).join('');
+      return 'avc1.' + hex;
+    }
+  }
+  return null;
+}
+
+function handleH264Message(u8) {
+  const isKey = (u8[0] & 1) === 1;
+  const data = u8.subarray(1);
+  if (needKey && !isKey) return;
+  if (isKey) {
+    const cs = codecStringFromAU(data);
+    if (!cs) return;
+    if (!decoder || codecStr !== cs) {
+      if (decoder) { try { decoder.close(); } catch {} }
+      decoder = new VideoDecoder({ output: offerFrame, error: (e) => { console.error('decoder:', e); needKey = true; } });
+      decoder.configure({ codec: cs, optimizeForLatency: true });
+      codecStr = cs;
+    }
+    needKey = false;
+  }
+  if (!decoder) return;
+  try {
+    decoder.decode(new EncodedVideoChunk({
+      type: isKey ? 'key' : 'delta',
+      timestamp: Math.round(performance.now() * 1000),
+      data,
+    }));
+    if (decoder.decodeQueueSize > 15) {
+      needKey = true;
+      try { decoder.close(); } catch {}
+      decoder = null;
+    }
+  } catch (e) {
+    console.error('decode:', e);
+    needKey = true;
+  }
+}
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/${wsQuery}`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'init', codec: mode }));
+  ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      const u8 = new Uint8Array(e.data);
+      if (mode === 'h264') handleH264Message(u8); else handleWebpFrame(u8);
+      return;
+    }
+    try { onWsJson(JSON.parse(e.data)); } catch {}
+  };
+  ws.onclose = () => setTimeout(connect, 1500);
+}
+
+function applyRes(name) {
+  // server-side switch (ABR): prepare new-size frame filter + overlay until the first frame
+  const dims = resMap[name];
+  if (!dims || name === selName) return;
+  selName = name;
+  targetW = dims.w; targetH = dims.h;
+  c.width = dims.w; c.height = dims.h;
+  switching = true;
+  document.getElementById('resBadge').textContent = name.replace('x', '×');
+  document.getElementById('overlay').classList.add('show');
+  setTimeout(() => {
+    if (!switching) return;
+    switching = false;
+    targetW = 0; targetH = 0;
+    document.getElementById('overlay').classList.remove('show');
+  }, 8000);
+}
+
+function loadResolutions() {
+  fetch(withAuth('/resolutions')).then(r => r.json()).then(d => {
+    for (const name of d.options) {
+      const [w, h] = name.split('x').map(Number);
+      // h264 full-res may be encoded downscaled (srSize); webp — 1004x2231; accept both
+      resMap[name] = { w, h, okW: name === '1004x2231' ? [w, 486, 540, 720, 1004, 1080] : [w] };
+    }
+    selName = d.current;
+    document.getElementById('resBadge').textContent = d.current.replace('x', '×');
+  }).catch(() => {});
+}
+
+const SCREEN_W = 1080, SCREEN_H = 2400;
+function toScreen(cx, cy) {
+  const r = c.getBoundingClientRect();
+  let x = Math.round((cx - r.left) / r.width * SCREEN_W);
+  let y = Math.round((cy - r.top) / r.height * SCREEN_H);
+  if (y < 10) y = 10;
+  if (y > SCREEN_H - 10) y = SCREEN_H - 10;
+  return {
+    x: Math.max(0, Math.min(SCREEN_W, x)),
+    y
+  };
+}
+
+function send(obj) {
+  if (!devInput) return;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+let dragging = false, sx = 0, sy = 0, t0 = 0;
+
+c.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  c.setPointerCapture(e.pointerId);
+  dragging = true;
+  const p = toScreen(e.clientX, e.clientY);
+  sx = p.x; sy = p.y; t0 = performance.now();
+});
+c.addEventListener('pointermove', (e) => { if (dragging) e.preventDefault(); });
+c.addEventListener('pointerup', (e) => {
+  if (!dragging) return;
+  e.preventDefault();
+  c.releasePointerCapture(e.pointerId);
+  dragging = false;
+  const p = toScreen(e.clientX, e.clientY);
+  const dx = Math.abs(p.x - sx), dy = Math.abs(p.y - sy);
+  const dt = performance.now() - t0;
+  if (dx < 20 && dy < 20 && dt < 500) {
+    send({ type: 'tap', x: sx, y: sy });
+  } else {
+    send({ type: 'swipe', x1: sx, y1: sy, x2: p.x, y2: p.y, ms: Math.round(Math.max(100, dt)) });
+  }
+});
+
+c.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const p = toScreen(e.clientX, e.clientY);
+  const steps = Math.max(1, Math.min(5, Math.round(Math.abs(e.deltaY) / 100)));
+  send({ type: 'scroll', x: p.x, y: p.y, dy: e.deltaY > 0 ? steps : -steps });
+}, { passive: false });
+
+// keyboard: printable characters → device text, special keys → keycodes;
+// Ctrl+C — grab device clipboard, Ctrl+V — paste into the focused device field
+const KEY_CODES = {
+  Backspace: 67, Enter: 66, Tab: 61, Escape: 111,
+  ArrowUp: 19, ArrowDown: 20, ArrowLeft: 21, ArrowRight: 22,
+};
+document.addEventListener('keydown', (e) => {
+  // AltGraph characters (Cyrillic on some layouts) arrive as ctrl+alt — treat as a printable character
+  const altGraph = typeof e.getModifierState === 'function' && e.getModifierState('AltGraph');
+  if ((e.ctrlKey || e.metaKey || e.altKey) && !altGraph) {
+    if (e.ctrlKey && e.code === 'KeyC') send({ type: 'clip-get' });
+    if (e.ctrlKey && e.code === 'KeyV') {
+      navigator.clipboard.readText().then((text) => {
+        if (text) send({ type: 'clip-set', text, paste: true });
+      }).catch(() => {});
+    }
+    return; // other modifiers — browser shortcuts, do not intercept
+  }
+  const code = KEY_CODES[e.key];
+  if (code !== undefined) {
+    e.preventDefault();
+    send({ type: 'key', code });
+    return;
+  }
+  if (e.key.length === 1) {
+    e.preventDefault();
+    send({ type: 'text', text: e.key });
+  }
+});
+
+function onWsJson(d) {
+  if (d.type === 'res' && d.name) applyRes(d.name);
+  if (d.type === 'input-mode') applyInputMode(!!d.enabled);
+  if (d.type === 'clip' && d.text) {
+    navigator.clipboard.writeText(d.text).catch(() => {});
+  }
+}
+
+// drag&drop APK/files — as in ws-scrcpy
+document.addEventListener('dragover', (e) => e.preventDefault());
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!f) return;
+  const isApk = f.name.toLowerCase().endsWith('.apk');
+  if (!isApk && !/\.(zip|mp4|jpg|png|pdf|txt)$/i.test(f.name)) return;
+  const old = fpsEl.textContent;
+  fpsEl.textContent = f.name.length > 14 ? f.name.slice(0, 12) + '…' : f.name;
+  fetch(withAuth(`/push?name=${encodeURIComponent(f.name)}`), { method: 'POST', body: f })
+    .then(r => r.json())
+    .then(d => { fpsEl.textContent = d.ok ? '✓ ' + d.kind : '✗ push'; })
+    .catch(() => { fpsEl.textContent = '✗ push'; })
+    .finally(() => setTimeout(() => { fpsEl.textContent = old; }, 4000));
+});
+
+buttons.querySelectorAll('.nav-btn').forEach(btn => {
+  btn.addEventListener('click', () => send({ type: 'key', code: parseInt(btn.dataset.key) }));
+});
+
+fsBtn.addEventListener('click', () => {
+  if (!document.fullscreenElement) {
+    document.body.requestFullscreen().then(() => {
+      document.body.classList.add('fullscreen');
+      fsBtn.textContent = '✕';
+    });
+  } else {
+    document.exitFullscreen().then(() => {
+      document.body.classList.remove('fullscreen');
+      fsBtn.textContent = '⛶';
+    });
+  }
+});
+
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement) {
+    document.body.classList.remove('fullscreen');
+    fsBtn.textContent = '⛶';
+  }
+});
+
+connect();
+loadResolutions();
+</script>
+</body>
+</html>
