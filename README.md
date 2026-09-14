@@ -51,21 +51,25 @@ Linux, macOS and Windows are supported. The primary H.264 path works everywhere;
 
 ```bash
 git clone https://github.com/cirkasssian/Droid-Lab-MCP.git droidlab && cd droidlab
-npm install        # ws, @modelcontextprotocol/sdk, zod
+bash scripts/install-mcp.sh
 ```
 
-Register the server in your MCP client (`opencode.json`, `claude_desktop_config.json`, …):
+The installer is **safe by design**: it locates node at known absolute paths and never invokes `brew upgrade`/`brew reinstall` (a bare brew operation can collateral-upgrade unrelated apps — this is exactly how an improvised install broke opencode on 2026-09-14: `brew reinstall node` → brew replaced the opencode binary → every prompt failed with "Failed to send prompt"). If node is missing, it installs it with collateral-upgrade guards, smoke-tests the MCP handshake, and registers the server in `~/.config/opencode/opencode.json[c]` (idempotent, with a backup).
+
+Manual registration (any MCP client) — **always use the absolute node path**; GUI clients do not inherit the interactive shell PATH, so a bare `"node"` silently fails there:
 
 ```json
 {
   "mcpServers": {
     "droidlab": {
-      "command": "node",
+      "command": "/opt/homebrew/bin/node",
       "args": ["/absolute/path/to/droidlab/mcp/server.mcp.mjs"]
     }
   }
 }
 ```
+
+opencode (`opencode.jsonc`) uses the `"mcp"` block format: `"command": ["/opt/homebrew/bin/node", "/path/to/mcp/server.mcp.mjs"]` plus `"env": { "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" }` as a fallback.
 
 A typical first session:
 
