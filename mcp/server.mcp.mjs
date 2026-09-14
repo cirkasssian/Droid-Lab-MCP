@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import https from 'node:https';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
@@ -25,6 +26,7 @@ const XVFB_SCREEN = process.env.X_DISPLAY || ':99';
 const PREFERRED_AVD = process.env.EMU_AVD || null;
 const EMU_APPEND_ARGS = process.env.EMU_EXTRA_ARGS || '';
 const BOOT_DEADLINE_MS = parseInt(process.env.BOOT_TIMEOUT_MS || '120000', 10);
+const SCRCPY_VERSION = process.env.SCRCPY_VERSION || '4.1';
 
 // --- portable paths and process management ---
 
@@ -280,6 +282,7 @@ const awaitHttpUp = async (url, timeoutMs) => {
 };
 
 const bootRelay = async (host) => {
+  try { await ensureScrcpyCached(null); } catch (e) { console.error(`[env] scrcpy bootstrap skipped: ${e.message}`); }
   const token = crypto.randomBytes(24).toString('hex');
   const accessToken = crypto.randomBytes(16).toString('hex');
   const child = launchDetached(process.execPath, [path.join(PROJECT_HOME, 'web', 'server.js')], {
@@ -290,6 +293,7 @@ const bootRelay = async (host) => {
       WEB_ACCESS_TOKEN: accessToken,
       X_DISPLAY: XVFB_SCREEN,
       ADB: ADB_EXEC,
+      ...(scrcpyPathsCache ? { SCRCPY: scrcpyPathsCache.scrcpy, SCRCPY_SERVER: scrcpyPathsCache.server } : {}),
     },
     logName: 'bridge.log',
   });
@@ -437,6 +441,92 @@ const awaitBoot = async (timeoutMs, extra) => {
   throw new Error(`emulator did not boot within ${Math.round(timeoutMs / 1000)}s (log: ${path.join(dataDir(), 'emulator.log')})`);
 };
 
+// --- scrcpy self-bootstrap (h264 video source; downloaded on demand into ~/bin/scrcpy) ---
+
+const SCRCPY_HOME = path.join(os.homedir(), 'bin', 'scrcpy');
+
+const globScrcpyBin = (name) => {
+  try {
+    for (const e of fs.readdirSync(SCRCPY_HOME)) {
+      const p = path.join(SCRCPY_HOME, e, name);
+      if (fs.existsSync(p)) return p;
+    }
+  } catch {}
+  return null;
+};
+
+const httpsDownload = (url, dest, extra, label) => new Promise((resolve, reject) => {
+  const fetchOnce = (u, redirectsLeft) => {
+    if (extra?.signal?.aborted) { reject(new Error(`cancelled by client: ${label}`)); return; }
+    const req = https.get(u, { headers: { 'user-agent': 'droidlab-mcp' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectsLeft > 0) {
+        res.resume();
+        fetchOnce(new URL(res.headers.location, u).toString(), redirectsLeft - 1);
+        return;
+      }
+      if (res.statusCode !== 200) { res.resume(); reject(new Error(`${label}: HTTP ${res.statusCode} from ${u}`)); return; }
+      const total = parseInt(res.headers['content-length'] || '0', 10);
+      let got = 0, lastPct = -1;
+      const out = fs.createWriteStream(dest);
+      res.on('data', (c) => {
+        got += c.length;
+        if (total) {
+          const pct = Math.round((got / total) * 100);
+          if (pct !== lastPct) { lastPct = pct; emitProgress(extra, pct, 100, `downloading ${label}`).catch(() => {}); }
+        }
+        if (extra?.signal?.aborted) {
+          req.destroy(); out.destroy(); fs.rmSync(dest, { force: true });
+          reject(new Error(`cancelled by client: ${label}`));
+        }
+      });
+      res.pipe(out);
+      out.on('finish', () => out.close(() => resolve(dest)));
+      out.on('error', (e) => { fs.rmSync(dest, { force: true }); reject(e); });
+      res.on('error', (e) => { out.destroy(); fs.rmSync(dest, { force: true }); reject(e); });
+    });
+    req.on('error', reject);
+    req.setTimeout(120000, () => req.destroy(new Error(`${label}: download timed out`)));
+  };
+  fetchOnce(url, 5);
+});
+
+const scrcpyAssetName = () => {
+  if (process.platform === 'darwin') return process.arch === 'arm64' ? 'macos-aarch64' : 'macos-x86_64';
+  if (process.platform === 'linux') {
+    if (process.arch !== 'x64') throw new Error(`scrcpy: no prebuilt asset for linux/${process.arch}`);
+    return 'linux-x86_64';
+  }
+  throw new Error(`scrcpy auto-install is not supported on ${process.platform} — install it manually or set SCRCPY/SCRCPY_SERVER`);
+};
+
+let scrcpyPathsCache = null;
+const ensureScrcpy = async (extra) => {
+  const byEnv = (p) => (p && fs.existsSync(p) ? p : null);
+  const scrcpy = byEnv(process.env.SCRCPY) || globScrcpyBin(process.platform === 'win32' ? 'scrcpy.exe' : 'scrcpy');
+  const server = byEnv(process.env.SCRCPY_SERVER) || globScrcpyBin('scrcpy-server');
+  if (scrcpy && server) { scrcpyPathsCache = { scrcpy, server }; return scrcpyPathsCache; }
+  const asset = scrcpyAssetName();
+  fs.mkdirSync(SCRCPY_HOME, { recursive: true });
+  if (!scrcpy) {
+    const tgz = path.join(os.tmpdir(), `scrcpy-${asset}-v${SCRCPY_VERSION}.tar.gz`);
+    await httpsDownload(`https://github.com/Genymobile/scrcpy/releases/download/v${SCRCPY_VERSION}/scrcpy-${asset}-v${SCRCPY_VERSION}.tar.gz`, tgz, extra, `scrcpy v${SCRCPY_VERSION} (${asset})`);
+    await execCmd('tar', ['-xzf', tgz, '-C', SCRCPY_HOME], { timeout: 120000 });
+    fs.rmSync(tgz, { force: true });
+  }
+  const scrcpyBin = scrcpy || globScrcpyBin(process.platform === 'win32' ? 'scrcpy.exe' : 'scrcpy');
+  if (!scrcpyBin) throw new Error(`scrcpy was unpacked into ${SCRCPY_HOME}, but the binary was not found`);
+  const dir = path.dirname(scrcpyBin);
+  let serverBin = server;
+  if (!serverBin) {
+    serverBin = path.join(dir, 'scrcpy-server');
+    await httpsDownload(`https://github.com/Genymobile/scrcpy/releases/download/v${SCRCPY_VERSION}/scrcpy-server-v${SCRCPY_VERSION}`, serverBin, extra, 'scrcpy-server');
+  }
+  try { fs.chmodSync(scrcpyBin, 0o755); } catch {}
+  scrcpyPathsCache = { scrcpy: scrcpyBin, server: serverBin };
+  return scrcpyPathsCache;
+};
+const ensureScrcpyCached = (extra) => (scrcpyPathsCache ? Promise.resolve(scrcpyPathsCache) : ensureScrcpy(extra));
+
 const ensureRelayUp = async () => {
   try { await relayJson('/state'); return { started: false }; } catch {}
   await bootRelay('127.0.0.1');
@@ -532,7 +622,7 @@ const renderStatus = (s) => {
   return lines.join('\n');
 };
 
-const mcp = new McpServer({ name: 'droidlab', version: '1.0.0' });
+const mcp = new McpServer({ name: 'droidlab', version: '1.1.0' });
 
 let startGate = false; // mutex: parallel env_start calls conflict over pidfiles and spawn
 
@@ -543,7 +633,7 @@ mcp.registerTool(
   'env_start',
   {
     title: 'Start emulator environment',
-    description: 'Start the environment: Xvfb (Linux) + Android emulator (cold boot, the device state after env_stop is lost) + bridge on loopback. The first start takes ~30-60s (boot). If the emulator is already running — returns status (idempotent); for a different AVD run env_stop first. The bridge starts with browser input disabled until set_dev_input(true).',
+    description: 'Start the environment: Xvfb (Linux) + Android emulator (cold boot, the device state after env_stop is lost) + bridge on loopback. The first start takes ~30-60s (boot). If the emulator is already running — returns status (idempotent); for a different AVD run env_stop first. The bridge starts with browser input disabled until set_dev_input(true). Self-bootstrap: a missing AVD is created automatically (google_apis image for the host ABI is downloaded via sdkmanager, SDK licenses auto-accepted); missing cmdline-tools, java (Android Studio JBR) or scrcpy are downloaded/fetched too — network access is required.',
     inputSchema: {
       avd: z.string().optional().describe('Name from mcp/emulators.json ("android-13") or raw AVD name ("API33"). Default: EMU_AVD env, otherwise the first entry in the config.'),
     },
@@ -563,7 +653,10 @@ mcp.registerTool(
       }
 
       let emulatorStarted = false;
+      const bootstrapLog = [];
       if (!emu.running) {
+        bootstrapLog.push(...await ensureAvd(avdName, entry, extra));
+
         if (process.platform !== 'linux') {
           // Xvfb is only needed for the webp fallback (x11grab); the h264 path does without it
           console.error('[env] non-Linux: Xvfb skipped (webp-fallback unavailable)');
@@ -615,14 +708,20 @@ mcp.registerTool(
         await awaitBoot(BOOT_DEADLINE_MS, extra);
       }
 
+      let scrcpyWarning = null;
+      try { await ensureScrcpyCached(extra); }
+      catch (e) { scrcpyWarning = `scrcpy bootstrap failed (${e.message}) — h264 video may not stream`; }
+
       const bridge = await ensureRelayUp();
       const status = await collectStatus();
 
       const parts = [];
+      parts.push(...bootstrapLog);
       if (emu.adopted) parts.push('External (non-MCP) emulator detected — it is being used; env_stop will not stop it.');
       if (emulatorStarted) parts.push(`Emulator ${avdName} started (cold boot${entry?.note ? `, note: ${entry.note}` : ''}); the device state is lost on env_stop.`);
       else parts.push(`Emulator ${avdName} was already running.`);
       if (bridge.started) parts.push('Bridge started on loopback with a token: browser input is disabled until set_dev_input(true).');
+      if (scrcpyWarning) parts.push(scrcpyWarning);
       parts.push(renderStatus(status));
       return replyText(parts.join('\n'));
     } catch (e) { return replyError(e); }
@@ -794,10 +893,37 @@ mcp.registerTool(
 
 // --- system image and AVD management (SDK) ---
 
+// SDK root used for self-bootstrap installs (first existing root, else the platform default, created on demand)
+const sdkRootDir = () => {
+  const roots = [process.env.ANDROID_HOME, process.env.ANDROID_SDK_ROOT];
+  if (process.platform === 'darwin') roots.push(path.join(os.homedir(), 'Library', 'Android', 'sdk'));
+  else if (process.platform === 'win32') roots.push(path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Android', 'Sdk'));
+  else roots.push(path.join(os.homedir(), 'Android', 'Sdk'));
+  for (const r of roots) { if (r && fs.existsSync(r)) return r; }
+  const def = roots.find(Boolean);
+  fs.mkdirSync(def, { recursive: true });
+  return def;
+};
+
+// cmdline-tools may be installed under a version dir (cmdline-tools/<ver>) instead of 'latest'
+const cmdlineToolsBin = (tool) => {
+  const exe = process.platform === 'win32' ? `${tool}.bat` : tool;
+  const ctDir = path.join(sdkRootDir(), 'cmdline-tools');
+  let versions = [];
+  try { versions = fs.readdirSync(ctDir).sort().reverse(); } catch {}
+  for (const v of ['latest', ...versions.filter((v) => v !== 'latest')]) {
+    const p = path.join(ctDir, v, 'bin', exe);
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+};
+
 const sdkmanagerPath = () => {
   const p = path.join('cmdline-tools', 'latest', 'bin', process.platform === 'win32' ? 'sdkmanager.bat' : 'sdkmanager');
   const found = locateSdkTool(p);
   if (found !== p && fs.existsSync(found)) return found;
+  const versioned = cmdlineToolsBin('sdkmanager');
+  if (versioned) return versioned;
   const legacy = locateSdkTool(path.join('tools', 'bin', process.platform === 'win32' ? 'sdkmanager.bat' : 'sdkmanager'));
   if (legacy !== path.join('tools', 'bin', process.platform === 'win32' ? 'sdkmanager.bat' : 'sdkmanager') && fs.existsSync(legacy)) return legacy;
   throw new Error('sdkmanager not found — install Android cmdline-tools (cmdline-tools/latest)');
@@ -807,14 +933,60 @@ const avdmanagerPath = () => {
   const p = path.join('cmdline-tools', 'latest', 'bin', process.platform === 'win32' ? 'avdmanager.bat' : 'avdmanager');
   const found = locateSdkTool(p);
   if (found !== p && fs.existsSync(found)) return found;
+  const versioned = cmdlineToolsBin('avdmanager');
+  if (versioned) return versioned;
   const legacy = locateSdkTool(path.join('tools', 'bin', process.platform === 'win32' ? 'avdmanager.bat' : 'avdmanager'));
   if (legacy !== path.join('tools', 'bin', process.platform === 'win32' ? 'avdmanager.bat' : 'avdmanager') && fs.existsSync(legacy)) return legacy;
   throw new Error('avdmanager not found — install Android cmdline-tools (cmdline-tools/latest)');
 };
 
+// Self-bootstrap for the toolchain itself: when sdkmanager/avdmanager are absent,
+// the official cmdline-tools package is downloaded into <sdk>/cmdline-tools/latest.
+// If no system java exists, Android Studio's bundled JBR is wired into JAVA_HOME/PATH.
+const CMDLINE_TOOLS_BUILD = '13114758';
+
+const ensureJava = async () => {
+  try { await execCmd('java', ['-version'], { timeout: 10000 }); return; } catch {}
+  const jbr = process.platform === 'darwin'
+    ? '/Applications/Android Studio.app/Contents/jbr/Contents/Home'
+    : process.platform === 'win32'
+      ? path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Android', 'Android Studio', 'jbr')
+      : null;
+  const javaBin = jbr && fs.existsSync(path.join(jbr, process.platform === 'win32' ? 'bin/java.exe' : 'bin/java')) ? path.join(jbr, 'bin', process.platform === 'win32' ? 'java.exe' : 'java') : null;
+  if (!javaBin) throw new Error('no java on PATH and no Android Studio JBR found — sdkmanager needs a JDK');
+  process.env.JAVA_HOME = jbr;
+  process.env.PATH = `${path.dirname(javaBin)}${path.delimiter}${process.env.PATH || ''}`;
+};
+
+const ensureCmdlineTools = async (extra) => {
+  try { sdkmanagerPath(); avdmanagerPath(); return; } catch {}
+  await emitProgress(extra, 0, 100, 'installing Android cmdline-tools').catch(() => {});
+  await ensureJava();
+  const osPart = process.platform === 'darwin' ? 'mac' : process.platform === 'win32' ? 'win' : 'linux';
+  const sdkBase = sdkRootDir();
+  const zip = path.join(os.tmpdir(), `commandlinetools-${osPart}-${CMDLINE_TOOLS_BUILD}.zip`);
+  await httpsDownload(`https://dl.google.com/android/repository/commandlinetools-${osPart}-${CMDLINE_TOOLS_BUILD}_latest.zip`, zip, extra, 'Android cmdline-tools');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'droidlab-cmdline-'));
+  try {
+    await execCmd('unzip', ['-q', zip, '-d', tmp], { timeout: 180000 });
+    const dest = path.join(sdkBase, 'cmdline-tools');
+    fs.mkdirSync(dest, { recursive: true });
+    const latest = path.join(dest, 'latest');
+    const srcTools = path.join(tmp, 'cmdline-tools');
+    if (fs.existsSync(latest) && !fs.existsSync(path.join(latest, 'bin', process.platform === 'win32' ? 'sdkmanager.bat' : 'sdkmanager'))) {
+      fs.rmSync(latest, { recursive: true, force: true }); // replace an incomplete install only
+    }
+    if (!fs.existsSync(latest)) fs.renameSync(srcTools, latest);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(zip, { force: true });
+  }
+  try { sdkmanagerPath(); avdmanagerPath(); }
+  catch { throw new Error('cmdline-tools were installed, but sdkmanager/avdmanager are still not found'); }
+};
+
 const presentImages = () => {
-  const sdkBase = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || path.join(os.homedir(), 'Android', 'Sdk');
-  const imgRoot = path.join(sdkBase, 'system-images');
+  const imgRoot = path.join(sdkRootDir(), 'system-images');
   const collected = [];
   try {
     for (const apiLv of fs.readdirSync(imgRoot)) {
@@ -845,6 +1017,76 @@ const splitSdkmanagerList = (stdout) => {
     if (IMAGE_PKG_RE.test(pkg) && !available.has(pkg)) available.set(pkg, true);
   }
   return [...available.keys()].sort();
+};
+
+// Shared core of system_image_install and the env_start AVD self-bootstrap.
+// Pending SDK licenses are auto-accepted ('y') so a fresh machine does not stall on the prompt.
+const installImage = (pkg, extra) => new Promise((resolve, reject) => {
+  const LIMIT_MS = 30 * 60 * 1000;
+  const child = spawn(sdkmanagerPath(), ['--install', pkg], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  let out = '', errOut = '', lastPct = -1, killReason = null;
+  const timer = setTimeout(() => { killReason = '30-minute limit exceeded'; child.kill('SIGKILL'); }, LIMIT_MS);
+  const abortWatch = setInterval(() => {
+    if (extra?.signal?.aborted && !killReason) { killReason = 'cancelled by client'; child.kill('SIGKILL'); }
+  }, 1000);
+  child.stdout.on('data', (c) => {
+    out += c;
+    const pcts = [...out.matchAll(/\[(\d+)%\]/g)]; // sdkmanager output: "[ 42%] ..."
+    if (pcts.length) {
+      const pct = parseInt(pcts[pcts.length - 1][1], 10);
+      if (pct !== lastPct) { lastPct = pct; emitProgress(extra, pct, 100, 'downloading image').catch(() => {}); }
+    }
+  });
+  child.stderr.on('data', (c) => { errOut += c; });
+  child.on('error', (e) => { clearTimeout(timer); clearInterval(abortWatch); reject(e); });
+  child.on('close', (c) => {
+    clearTimeout(timer); clearInterval(abortWatch);
+    if (killReason) reject(new Error(`sdkmanager aborted: ${killReason}`));
+    else resolve({ stdout: out, stderr: errOut, code: c ?? 1 });
+  });
+  child.stdin.write('y\n'.repeat(50));
+  child.stdin.end();
+});
+
+// env_start self-bootstrap: a missing AVD is created from a system image derived
+// from its name (API33 → system-images;android-33;google_apis;<host ABI>).
+const ensureAvd = async (avdName, entry, extra) => {
+  const log = [];
+  await ensureCmdlineTools(extra);
+  const listAvds = async () => (await execCmd(emulatorExecutable(), ['-list-avds'], { timeout: 15000 })).stdout.split('\n').map((s) => s.trim());
+  if ((await listAvds()).includes(avdName)) return log;
+  const api = avdName.match(/^API(\d+)$/i)?.[1];
+  if (!api) throw new Error(`AVD ${avdName} does not exist and its API level cannot be derived from the name (expected API<N>) — create it via avd_create`);
+  const abi = process.arch === 'arm64' ? 'arm64-v8a' : 'x86_64';
+  const pkg = `system-images;android-${api};google_apis;${abi}`;
+  log.push(`AVD ${avdName} is missing — self-bootstrap: ${pkg}`);
+  if (!presentImages().includes(pkg)) {
+    const avail = splitSdkmanagerList((await execCmd(sdkmanagerPath(), ['--list'], { timeout: 120000, maxBuffer: 32 * 1024 * 1024 })).stdout);
+    if (!avail.includes(pkg)) {
+      const sameApi = avail.filter((p) => p.startsWith(`system-images;android-${api};`));
+      throw new Error(`image ${pkg} is not available for download. Alternatives for this API level: ${sameApi.join(', ') || 'none'}`);
+    }
+    const { code, stderr, stdout } = await installImage(pkg, extra);
+    if (code !== 0) throw new Error(`sdkmanager --install ${pkg} failed (code ${code}):\n${(stderr || stdout).trim().split('\n').slice(-5).join('\n')}`);
+    if (!presentImages().includes(pkg)) throw new Error(`image ${pkg} was not found after install (check sdkmanager output)`);
+    log.push(`image installed: ${pkg} (pixel_7 device profile on AVD creation)`);
+  }
+  const avdRoot = path.join(os.homedir(), '.android', 'avd');
+  fs.mkdirSync(avdRoot, { recursive: true });
+  await execCmd(avdmanagerPath(), ['create', 'avd', '-n', avdName, '-k', pkg, '-d', 'pixel_7', '--force'],
+    { timeout: 60000, env: { ANDROID_AVD_HOME: avdRoot, ANDROID_SDK_HOME: os.homedir() } });
+  if (!(await listAvds()).includes(avdName)) throw new Error(`AVD ${avdName} did not appear after avdmanager`);
+  log.push(`AVD created: ${avdName}`);
+  const cfg = readEmulatorRegistry();
+  if (!cfg.some((e) => e.avd === avdName)) {
+    cfg.push({ name: entry?.name || `android-${api}`, avd: avdName, note: `google_apis/${abi}` });
+    fs.writeFileSync(EMULATOR_REGISTRY, JSON.stringify(cfg, null, 2) + '\n');
+    log.push(`registered in mcp/emulators.json`);
+  }
+  return log;
 };
 
 mcp.registerTool(
@@ -884,7 +1126,7 @@ mcp.registerTool(
   'system_image_install',
   {
     title: 'Download Android system image',
-    description: 'Download a system image (sdkmanager --install). A package from system_images_list, e.g. system-images;android-34;google_apis;x86_64. Installation takes minutes, hard limit 30 min; supports client cancellation and reports download progress.',
+    description: 'Download a system image (sdkmanager --install). A package from system_images_list, e.g. system-images;android-34;google_apis;x86_64. Pending SDK licenses are auto-accepted (y). Installation takes minutes, hard limit 30 min; supports client cancellation and reports download progress.',
     inputSchema: {
       package: z.string().regex(IMAGE_PKG_RE, 'system-images;android-N;tag;abi'),
     },
@@ -892,41 +1134,8 @@ mcp.registerTool(
   },
   async ({ package: pkg }, extra) => {
     try {
-      // Feeding 'yes n' — we answer "no" to the license agreement (for images with accept);
-      // google_apis/default images accept automatically — this is a safety measure.
-      const LIMIT_MS = 30 * 60 * 1000; // limit from the tool description — actually in effect
-      const { stdout, stderr, code } = await new Promise((resolve, reject) => {
-        const child = spawn(sdkmanagerPath(), ['--install', pkg], {
-          stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
-        });
-        let out = '', errOut = '', lastPct = -1, killReason = null;
-        const timer = setTimeout(() => { killReason = '30-minute limit exceeded'; child.kill('SIGKILL'); }, LIMIT_MS);
-        const abortWatch = setInterval(() => {
-          if (extra?.signal?.aborted && !killReason) { killReason = 'cancelled by client'; child.kill('SIGKILL'); }
-        }, 1000);
-        child.stdout.on('data', (c) => {
-          out += c;
-          const pcts = [...out.matchAll(/\[(\d+)%\]/g)]; // sdkmanager output: "[ 42%] ..."
-          if (pcts.length) {
-            const pct = parseInt(pcts[pcts.length - 1][1], 10);
-            if (pct !== lastPct) { lastPct = pct; emitProgress(extra, pct, 100, 'downloading image'); }
-          }
-        });
-        child.stderr.on('data', (c) => { errOut += c; });
-        child.on('error', (e) => { clearTimeout(timer); clearInterval(abortWatch); reject(e); });
-        child.on('close', (c) => {
-          clearTimeout(timer); clearInterval(abortWatch);
-          if (killReason) reject(new Error(`sdkmanager aborted: ${killReason}`));
-          else resolve({ stdout: out, stderr: errOut, code: c ?? 1 });
-        });
-        child.stdin.write('\n');
-        child.stdin.end();
-      });
-      if (code !== 0) {
-        const tail = (stderr || stdout).trim().split('\n').slice(-5).join('\n');
-        throw new Error(`sdkmanager returned code ${code}:\n${tail}`);
-      }
+      const { code } = await installImage(pkg, extra);
+      if (code !== 0) throw new Error(`sdkmanager returned code ${code}`);
       const installed = presentImages().includes(pkg);
       return replyText([
         installed ? `Image installed: ${pkg}` : `sdkmanager ran, but the image directory was not found (check manually): ${pkg}`,

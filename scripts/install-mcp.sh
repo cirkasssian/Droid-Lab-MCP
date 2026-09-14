@@ -49,8 +49,12 @@ case "$NODE_BIN" in /*) ;; *) NODE_BIN="$(command -v node)" ;; esac
 log "node: $NODE_BIN ($("$NODE_BIN" --version))"
 
 # ---------- 2. repo-local dependencies ----------
-log "npm install (repo-local, no global changes)"
-(cd "$REPO_DIR" && npm install --no-fund --no-audit --silent) || die "npm install failed"
+# npm must be the sibling of the located node: SSH/GUI shells have no Homebrew PATH, bare `npm` breaks
+NPM_BIN="$(dirname "$NODE_BIN")/npm"
+[ -x "$NPM_BIN" ] || NPM_BIN="$(command -v npm || true)"
+[ -n "$NPM_BIN" ] && [ -x "$NPM_BIN" ] || die "npm not found next to $NODE_BIN and not on PATH"
+log "npm install (repo-local, no global changes): $NPM_BIN"
+(cd "$REPO_DIR" && PATH="$(dirname "$NODE_BIN"):$PATH" "$NPM_BIN" install --no-fund --no-audit --silent) || die "npm install failed"
 
 # ---------- 3. smoke test: MCP stdio handshake ----------
 log "smoke test: MCP handshake"

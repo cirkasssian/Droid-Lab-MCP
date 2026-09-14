@@ -47,6 +47,8 @@
 
 Linux, macOS and Windows are supported. The primary H.264 path works everywhere; the WebP fallback (browsers without WebCodecs) is Linux-only.
 
+**Self-bootstrap:** missing pieces are downloaded on demand. `env_start` creates a missing AVD by itself — it derives the API level from the AVD name (`API33` → `system-images;android-33;google_apis;<host ABI>`, arm64 hosts get `arm64-v8a`), downloads the image via `sdkmanager` (pending SDK licenses are auto-accepted, 30-min cap) and runs `avdmanager create avd -d pixel_7`. If `sdkmanager`/`avdmanager` are absent, the official cmdline-tools package is fetched into `<sdk>/cmdline-tools/latest`; when no system java exists, Android Studio's bundled JBR is wired into `JAVA_HOME`/`PATH`. Missing scrcpy is downloaded to `~/bin/scrcpy/` (release v4.1 asset for the platform + `scrcpy-server` jar) before the bridge starts; `SCRCPY`/`SCRCPY_SERVER` env vars override the lookup. Downloads need network access.
+
 ## Agent quick start
 
 ```bash
