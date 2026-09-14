@@ -16,14 +16,7 @@
 ```
 
 <p align="center">
-  <img src="docs/demo.png" width="74%" alt="DroidLab in a real browser: the address bar shows the stream URL, the Android screen plays in the page">
-</p>
-<p align="center">
-  <img src="docs/demo-app-before.png" width="46%" alt="An app streamed to the browser — a Show greeting button">
-  <img src="docs/demo-app-after.png" width="46%" alt="The agent tapped the button — Hello world! appears on screen">
-</p>
-<p align="center">
-  <img src="docs/demo-mobile.png" width="20%" alt="The same bridge UI in a narrow mobile browser">
+  <img src="docs/demo-mobile.png" width="26%" alt="DroidLab in a real browser: the address bar shows the stream URL, the Android screen plays in the page">
 </p>
 <p align="center"><em>The stream is a normal web page in any browser — desktop or phone. The agent drives a real app over MCP (tap → <code>Hello world!</code>) while a human just opens a URL and watches.</em></p>
 
