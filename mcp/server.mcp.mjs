@@ -737,7 +737,7 @@ const renderStatus = (s) => {
   return lines.join('\n');
 };
 
-const mcp = new McpServer({ name: 'droidlab', version: '1.4.1' });
+const mcp = new McpServer({ name: 'droidlab', version: '1.4.2' });
 
 let startGate = false; // mutex: parallel env_start calls conflict over pidfiles and spawn
 
@@ -748,7 +748,7 @@ mcp.registerTool(
   'env_start',
   {
     title: 'Start emulator environment',
-    description: 'Start the environment: Android emulator (cold boot, the device state after env_stop is lost) + bridge on loopback. The first start takes ~30-60s (boot). If the emulator is already running — returns status (idempotent); for a different AVD run env_stop first. The bridge starts with browser input disabled until set_dev_input(true). Self-bootstrap: a missing AVD is created automatically (google_apis image for the host ABI is downloaded via sdkmanager, SDK licenses auto-accepted); missing cmdline-tools, java (Android Studio JBR) or scrcpy are downloaded/fetched too — network access is required.',
+    description: 'Start emulator (cold boot, state lost on env_stop) + bridge on loopback. Idempotent; for a different AVD run env_stop first. Browser input disabled until set_dev_input(true). Self-bootstraps missing AVD, cmdline-tools, java, scrcpy (network required). First start ~30-60s.',
     inputSchema: {
       avd: z.string().optional().describe('Name from mcp/emulators.json ("android-13") or raw AVD name ("API33"). Default: EMU_AVD env, otherwise the first entry in the config.'),
     },
@@ -849,7 +849,7 @@ mcp.registerTool(
   'env_stop',
   {
     title: 'Stop emulator environment',
-    description: 'Stop the bridge, the emulator (adb emu kill, then forcibly). Safe shutdown: processes from pidfiles are verified by cmdline; an external emulator (started not via env_start) is left alone if it is not in a pidfile — except adb emu kill, which by definition targets the emulator.',
+    description: 'Stop bridge + emulator (adb emu kill, then forced). External emulators (not via env_start) are left alone.',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
@@ -929,7 +929,7 @@ mcp.registerTool(
   'env_status',
   {
     title: 'Environment status',
-    description: 'Environment status: processes (bridge/emulator), the device (boot, Android version, screen, foreground app), input mode, bridge address.',
+    description: 'Status: processes, device (boot, Android version, screen, foreground app), input mode, bridge address.',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
@@ -1206,7 +1206,7 @@ mcp.registerTool(
   'system_images_list',
   {
     title: 'List Android system images',
-    description: 'Android system images: installed (from the SDK directory) and available for download (sdkmanager --list).',
+    description: 'System images: installed + available for download (sdkmanager --list).',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
@@ -1239,7 +1239,7 @@ mcp.registerTool(
   'system_image_install',
   {
     title: 'Download Android system image',
-    description: 'Download a system image (sdkmanager --install). A package from system_images_list, e.g. system-images;android-34;google_apis;x86_64. Pending SDK licenses are auto-accepted (y). Installation takes minutes, hard limit 30 min; supports client cancellation and reports download progress.',
+    description: 'Download system image (sdkmanager --install). Package from system_images_list. Licenses auto-accepted. 30-min cap, cancellable, progress.',
     inputSchema: {
       package: z.string().regex(IMAGE_PKG_RE, 'system-images;android-N;tag;abi'),
     },
@@ -1262,7 +1262,7 @@ mcp.registerTool(
   'avd_create',
   {
     title: 'Create AVD from system image',
-    description: 'Create an AVD from a system image (avdmanager create avd, device pixel_7) and add an entry to mcp/emulators.json. The tag/ABI are taken from the package.',
+    description: 'Create an AVD (pixel_7 profile) from a system image + add entry to emulators.json. Tag/ABI from the package.',
     inputSchema: {
       name: z.string().regex(/^[\w-]+$/, 'AVD name (letters, digits, _ and -)').describe('Name of the new AVD, e.g. API34'),
       package: z.string().regex(IMAGE_PKG_RE, 'system-images;android-N;tag;abi').describe('An installed image from system_images_list'),
@@ -1311,7 +1311,7 @@ mcp.registerTool(
   'screenshot',
   {
     title: 'Device screenshot',
-    description: 'Screenshot of the device screen at full resolution (adb screencap PNG, ~1080x2400): the full PNG is saved to shots/, and a downscaled JPEG (~720x1600) is returned in the response. Multiply UI coordinates from the downscaled image by 1.5 for tap/swipe (native pixels). ui_dump is faster for exact element coordinates.',
+    description: 'Full-res screenshot (PNG → shots/, downscaled JPEG inline). Multiply image coords by 1.5 for tap/swipe (native px). ui_dump is faster for exact coordinates.',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -1439,7 +1439,7 @@ mcp.registerTool(
   'text',
   {
     title: 'Type text on device',
-    description: 'Type text into the focused device field (Unicode/Cyrillic are supported via ADBKeyBoard). Long strings are automatically split into parts.',
+    description: 'Type text into focused field (Unicode/Cyrillic via ADBKeyBoard). Long strings auto-split.',
     inputSchema: {
       text: z.string().min(1).max(5000),
     },
@@ -1461,7 +1461,7 @@ mcp.registerTool(
   'clipboard_get',
   {
     title: 'Get device clipboard',
-    description: 'Read the device clipboard. Note: scrcpy suppresses re-sending UNCHANGED text — if the buffer has not changed since the last read, the response will not arrive within 5s (a note about it is returned; the control channel may also simply be busy). Parallel calls are serialized.',
+    description: 'Read the device clipboard. Scrcpy suppresses unchanged text — no response within 5s if buffer is unchanged. Parallel calls serialized.',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -1492,7 +1492,7 @@ mcp.registerTool(
   'clipboard_set',
   {
     title: 'Set device clipboard',
-    description: 'Write text to the device clipboard; paste=true — additionally paste into the focused field (a repeat call with paste duplicates the input — not idempotent).',
+    description: 'Write text to clipboard; paste=true also pastes into focused field (repeat with paste duplicates — not idempotent).',
     inputSchema: {
       text: z.string(),
       paste: z.boolean().optional(),
@@ -1509,7 +1509,7 @@ mcp.registerTool(
   'install_apk',
   {
     title: 'Install APK',
-    description: 'Install an APK on the device: adb install -r -t. The path is to a file on the machine with the emulator. Supports client cancellation (may take up to several minutes).',
+    description: 'Install APK (adb install -r -t). Path is on the emulator machine. Cancellable, may take minutes.',
     inputSchema: {
       path: z.string().describe('Absolute or relative path to the .apk'),
     },
@@ -1531,7 +1531,7 @@ mcp.registerTool(
   'push_file',
   {
     title: 'Push file to device',
-    description: 'Copy a file to the device (adb push). Supports client cancellation.',
+    description: 'Copy file to device (adb push). Cancellable.',
     inputSchema: {
       src: z.string().describe('Path on the machine with the emulator'),
       dst: z.string().describe('Path on the device, e.g. /sdcard/Download/'),
@@ -1553,7 +1553,7 @@ mcp.registerTool(
   'open_app',
   {
     title: 'Launch app by package',
-    description: 'Launch an app by package name (monkey → LAUNCHER intent), e.g. com.android.settings.',
+    description: 'Launch app by package (monkey → LAUNCHER intent), e.g. com.android.settings.',
     inputSchema: {
       package: z.string().regex(/^[\w.]+$/, 'package name'),
     },
@@ -1574,7 +1574,7 @@ mcp.registerTool(
   'deep_link',
   {
     title: 'Open deep link / URI',
-    description: 'Open a URI on the device (am start -a android.intent.action.VIEW): https links, app links, app schemes (myapp://...). An optional package force-selects the handler (-p).',
+    description: 'Open URI (VIEW intent): https, app links, custom schemes. Optional package force-selects handler.',
     inputSchema: {
       uri: z.string().regex(/^[a-zA-Z][a-zA-Z0-9+.-]*:[^\s'"]+$/, 'URI with a scheme, no spaces or quotes').describe('E.g. https://example.com/path or myapp://screen/Detail'),
       package: z.string().regex(/^[\w.]+$/, 'package name').optional().describe('Launch in a specific app'),
@@ -1599,7 +1599,7 @@ mcp.registerTool(
   'app_list',
   {
     title: 'List installed apps',
-    description: 'Installed packages (default: third-party only; system=true — including system). filter — a substring for selection (case-insensitive), so you do not pull hundreds of lines. The package name is for open_app/close_app.',
+    description: 'Installed packages (default: third-party; system=true includes system). filter = case-insensitive substring. Package names for open_app/close_app.',
     inputSchema: {
       system: z.boolean().optional().describe('true — also show system packages'),
       filter: z.string().min(2).optional().describe('Substring of the package name (case-insensitive)'),
@@ -1622,7 +1622,7 @@ mcp.registerTool(
   'close_app',
   {
     title: 'Force-stop app',
-    description: 'Force-stop an app (am force-stop) — works even for hung apps. The package is from app_list.',
+    description: 'Force-stop app (am force-stop), works even for hung apps. Package from app_list.',
     inputSchema: {
       package: z.string().regex(/^[\w.]+$/, 'package name'),
     },
@@ -1642,7 +1642,7 @@ mcp.registerTool(
   'app_permission',
   {
     title: 'Grant/revoke app permission',
-    description: 'Grant (grant=true) or revoke an app runtime permission (pm grant/revoke). Works only with dangerous permissions declared in the app manifest (otherwise pm refuses — that is normal).',
+    description: 'Grant/revoke runtime permission (pm grant/revoke). Only dangerous permissions declared in the manifest.',
     inputSchema: {
       package: z.string().regex(/^[\w.]+$/, 'package name'),
       permission: z.string().regex(/^[\w.]+$/, 'e.g. android.permission.CAMERA'),
@@ -1668,7 +1668,7 @@ mcp.registerTool(
   'pull_file',
   {
     title: 'Pull file from device',
-    description: 'Download a file from the device (adb pull) to the emulator machine. If dst is not set — saves to pulled/<file name> in the project root. Supports client cancellation.',
+    description: 'Download file from device (adb pull). Default dst: pulled/<basename> in project root. Cancellable.',
     inputSchema: {
       src: z.string().min(1).describe('Path on the device, e.g. /sdcard/Download/report.txt'),
       dst: z.string().optional().describe('Local file or directory (default pulled/<basename>)'),
@@ -1693,7 +1693,7 @@ mcp.registerTool(
   'logcat',
   {
     title: 'Read device log',
-    description: 'A snapshot of the device log (logcat -d, not a stream): the last N lines, an optional filter-spec (e.g. "ActivityManager:I *:S") and a substring filter (case-insensitive).',
+    description: 'Device log snapshot (logcat -d, not a stream). Last N lines, optional filter-spec and substring filter (case-insensitive).',
     inputSchema: {
       lines: z.number().int().min(1).max(2000).optional().describe('The last N lines (default 200)'),
       filter: z.string().regex(/^[\w./*: ,_-]+$/, 'filter-spec without quotes').optional().describe('logcat filter-spec, e.g. "ActivityManager:I *:S"'),
@@ -1785,7 +1785,7 @@ mcp.registerTool(
   'ui_dump',
   {
     title: 'Dump UI hierarchy',
-    description: 'Tree of visible UI elements (uiautomator dump): class, text/content-desc, resource-id, clickable/scrollable, bounds + element center in native pixels — exact coordinates for tap/swipe without guessing from a screenshot. The full XML is saved to shots/uidump-*.xml.',
+    description: 'UI element tree (uiautomator dump): class, text, desc, resource-id, clickable/scrollable, center(x,y) in native px for tap. Full XML saved to shots/.',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -1809,7 +1809,7 @@ mcp.registerTool(
   'wait_for',
   {
     title: 'Wait for UI element',
-    description: 'Wait for a visible UI element to appear — polling of the uiautomator tree on the server side (a replacement for dozens of ui_dump+sleep calls from the agent). Criteria: text/rid/desc as substrings (case-insensitive), specify at least one, conditions are combined with AND. Returns the found elements with center(x,y) ready for tap. Supports cancellation and progress.',
+    description: 'Poll the UI tree server-side until an element appears. Criteria: text/rid/desc substrings (case-insensitive, AND). Returns center(x,y) ready for tap. Replaces dozens of ui_dump+sleep calls.',
     inputSchema: {
       text: z.string().min(1).optional().describe('Substring in the element text'),
       rid: z.string().min(1).optional().describe('Substring in resource-id'),
@@ -1857,7 +1857,7 @@ mcp.registerTool(
   'device_state',
   {
     title: 'Device state',
-    description: 'Full state: process(es), boot, Android/API version, screen, stream resolution, foreground app, input mode.',
+    description: 'Full state: processes, boot, Android/API version, screen, resolution, foreground app, input mode.',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
@@ -1908,7 +1908,7 @@ mcp.registerTool(
   'access_start',
   {
     title: 'Enable LAN access',
-    description: 'Restart the bridge listening on all interfaces (0.0.0.0) and return a URL for the developer: live video + input in the browser (input — after set_dev_input(true)). Access is protected by an access token (generated at bridge start, passed in the URL). The input mode after the restart is reset to "observation".',
+    description: 'Bridge → 0.0.0.0; returns a tokenized LAN URL for live video + input. Input mode resets to observation; enable with set_dev_input(true).',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -1940,7 +1940,7 @@ mcp.registerTool(
   'access_stop',
   {
     title: 'Disable LAN access',
-    description: 'Return the bridge to loopback: access from the developer network is cut off (the stream will break). MCP continues to operate the device.',
+    description: 'Bridge → loopback; LAN access cut off. MCP continues to operate the device.',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -1956,7 +1956,7 @@ mcp.registerTool(
   'bridge_restart',
   {
     title: 'Restart the bridge',
-    description: 'Restart the relay/stream process (web/server.js) WITHOUT touching the emulator: applies bridge code changes and recovers a hung or dead bridge (boots one if none is running). Preserves the host binding (loopback / 0.0.0.0) and the developer-input mode; the access token is regenerated — hand the new URL from the reply to the developer. The browser video stream reconnects on page reload.',
+    description: 'Restart the bridge (web/server.js) without touching the emulator. Applies code changes, recovers a hung/dead bridge. Preserves host binding and input mode; access token regenerates (new URL in reply).',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -1996,7 +1996,7 @@ mcp.registerTool(
   'set_resolution',
   {
     title: 'Change stream resolution',
-    description: 'Change the stream resolution (ABR ladder: 324x720, 486x1080, 1004x2231). The 1004x2231 tier is not in the ABR ladder — an auto-downgrade will return 486x1080. list=true — show the available options and the current one.',
+    description: 'Change stream resolution (324x720, 486x1080, 1004x2231). 1004x2231 is manual-only (ABR may downgrade). list=true shows options.',
     inputSchema: {
       name: z.string().optional().describe('Resolution: 324x720 | 486x1080 | 1004x2231. Optional — if not set, the list is shown.'),
       list: z.boolean().optional().describe('true — show the list of available and the current resolution'),
@@ -2041,7 +2041,7 @@ mcp.registerTool(
   'reboot_emulator',
   {
     title: 'Reboot Android emulator',
-    description: 'Reboot the device (adb reboot). App state is preserved (not a cold boot). Waits for boot ~120s (supports cancellation and progress). The bridge and the stream are restored automatically.',
+    description: 'Reboot device (adb reboot). App state preserved. Waits ~120s for boot. Stream auto-restores.',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
@@ -2075,7 +2075,7 @@ mcp.registerTool(
   'adb_restart',
   {
     title: 'Restart adb server',
-    description: 'Restart the local adb server (adb kill-server + adb start-server): helps when adb is wedged — the device disappeared from `adb devices`, is stuck in offline/unauthorized, or port 5037 is held by a stale server. Connections and `adb reverse` tunnels drop for a few seconds; the bridge detects the loss and restarts its streams automatically once the device is back. The emulator, device state and files are NOT affected (this is not a device reboot — see reboot_emulator).',
+    description: 'Restart the adb server (kill-server + start-server). For wedged adb: device gone, offline/unauthorized, stale port 5037. Streams auto-recover. NOT a device reboot — see reboot_emulator.',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
@@ -2112,7 +2112,7 @@ mcp.registerTool(
   'set_dev_input',
   {
     title: 'Grant/revoke developer input',
-    description: 'Allow (enabled=true) or disallow (false) input from the developer browser. Works only when the bridge is controlled by MCP (has a token). A developer request "let me poke around" → set_dev_input(true); "give it back" → set_dev_input(false).',
+    description: 'Allow (true) or disallow (false) browser input. Requires MCP-controlled bridge (token). "Let me poke" → true; "give it back" → false.',
     inputSchema: {
       enabled: z.boolean(),
     },
@@ -2135,7 +2135,7 @@ mcp.registerTool(
   'shell',
   {
     title: 'Run adb shell command',
-    description: 'Run an arbitrary command on the device via adb shell (e.g. dumpsys battery, getprop, settings put/get, pm, ps, netstat, screenrecord). Prefer dedicated tools (tap, screenshot, logcat, …) when they cover the task; use shell for everything they miss.',
+    description: 'Raw adb shell (dumpsys, getprop, settings, pm, ps, netstat, screenrecord). Prefer dedicated tools when they cover the task.',
     inputSchema: {
       cmd: z.string().min(1).max(2000).describe('Shell command, e.g. "dumpsys battery"'),
       timeout: z.number().int().min(1000).max(120000).optional().describe('Timeout, ms (default 20000)'),
@@ -2162,7 +2162,7 @@ mcp.registerTool(
   'emu',
   {
     title: 'Run emulator console command',
-    description: 'Run a command on the emulator console (adb emu): battery emulation ("power acu off", "power capacity 50"), network ("network speed edge", "network delay umts"), GSM voice/data ("gsm data home"), incoming call/SMS ("gsm call 555", "sms send 555 hi"), GPS ("geo fix 37.6 55.7"), rotate. Requires a running emulator.',
+    description: 'Emulator console (adb emu): battery, network throttle, GSM call/SMS, GPS, rotate. Requires running emulator.',
     inputSchema: {
       cmd: z.string().min(1).max(500).describe('Console command, e.g. "power capacity 50"'),
     },
@@ -2184,7 +2184,7 @@ mcp.registerTool(
   'bugreport',
   {
     title: 'Collect Android bugreport',
-    description: 'Collect a full Android bug report (adb bugreport → zip in shots/): device state, logs, dumpsys for all services. Takes 1–3 minutes. Use for deep diagnostics when logcat/shell are not enough. Returns the local zip path.',
+    description: 'Full Android bugreport → zip in shots/ (1-3 min). For deep diagnostics when logcat/shell are not enough.',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
@@ -2207,7 +2207,7 @@ mcp.registerTool(
   'app_uninstall',
   {
     title: 'Uninstall an app',
-    description: 'Uninstall a third-party app from the device (adb uninstall). System apps cannot be removed this way. Returns adb output ("Success" on success).',
+    description: 'Uninstall a third-party app (adb uninstall). System apps cannot be removed.',
     inputSchema: {
       package: z.string().regex(/^[\w.]+$/, 'package name like com.example.app'),
     },
@@ -2228,7 +2228,7 @@ mcp.registerTool(
   'app_clear_data',
   {
     title: 'Clear app data',
-    description: 'Reset an app to its first-launch state (pm clear): wipes data, cache, logins and granted runtime permissions. Standard test hygiene between runs. Returns adb output ("Success" on success).',
+    description: 'Reset app to first-launch state (pm clear): wipes data, cache, logins, runtime permissions.',
     inputSchema: {
       package: z.string().regex(/^[\w.]+$/, 'package name like com.example.app'),
     },
@@ -2249,7 +2249,7 @@ mcp.registerTool(
   'bridge_logs',
   {
     title: 'Read host-side logs',
-    description: 'Read the tail of host-side log files from the state dir: file="bridge" — the relay/stream process (WS clients, scrcpy hosts, input errors); file="emulator" — the qemu console log; file="mcp" — this MCP server log. For on-device logs use logcat instead.',
+    description: 'Tail host-side logs: file="bridge" (relay/stream), "emulator" (qemu), "mcp" (this server). For on-device logs use logcat.',
     inputSchema: {
       file: z.enum(['bridge', 'emulator', 'mcp']).optional().describe('Which log to read (default bridge)'),
       lines: z.number().int().min(1).max(400).optional().describe('Last N lines (default 80)'),
@@ -2272,7 +2272,7 @@ mcp.registerTool(
   'pinch',
   {
     title: 'Pinch-zoom gesture (two fingers)',
-    description: 'Two-finger pinch at a point in native pixels: dist is the final separation between the fingers (px). dist > 200 — zoom in (spread), dist < 200 — zoom out (squeeze). Requires the bridge control channel (scrcpy) — no adb fallback.',
+    description: 'Two-finger pinch at a point (native px). dist = final finger separation: >200 zoom in, <200 zoom out. Scrcpy control channel only, no adb fallback.',
     inputSchema: {
       x: z.number().int().min(0).max(1080), y: z.number().int().min(0).max(2400),
       dist: z.number().int().min(50).max(2400).optional().describe('Final finger separation, px (default 400 = zoom in)'),
@@ -2290,7 +2290,7 @@ mcp.registerTool(
   'set_orientation',
   {
     title: 'Lock screen orientation',
-    description: 'Lock the device to portrait or landscape (settings put system user_rotation with accelerometer_rotation off), or restore auto-rotation (lock=false). Affects the whole device, not just the foreground app.',
+    description: 'Lock portrait/landscape or restore auto-rotation (lock=false). Affects whole device.',
     inputSchema: {
       orientation: z.enum(['portrait', 'landscape']),
       lock: z.boolean().optional().describe('false = restore auto-rotation (default true = lock to orientation)'),
@@ -2319,7 +2319,7 @@ mcp.registerTool(
   'mcp_config',
   {
     title: 'Get/set MCP configuration',
-    description: 'Read or update the persisted droidlab configuration (state dir/config.json). Options: port (bridge listen port, default 8090), requireToken (HTTP/WS access token, default true), defaultAvd (preferred AVD name, default null = first in emulators.json), extraArgs (extra emulator args, default ""), bootTimeoutMs (boot wait limit, default 120000), scrcpyVersion (scrcpy release, default "4.1"). Call with {show:true} to read all values, or pass keys to update (e.g. {port:9090}). {reset:true} restores built-in defaults. {defaults:true} persists the current defaults (marks config as user-confirmed, silences the first-run prompt). Changes apply on the next bridge start (bridge_restart or env_start).',
+    description: 'Read/update persisted config (state dir/config.json). Options: port, requireToken, defaultAvd, extraArgs, bootTimeoutMs, scrcpyVersion. {show:true} reads; pass keys to update; {reset:true} restores defaults; {defaults:true} confirms defaults. Changes apply on next bridge restart.',
     inputSchema: {
       show: z.boolean().optional().describe('true — return the current configuration'),
       reset: z.boolean().optional().describe('true — restore built-in defaults and delete config.json'),
