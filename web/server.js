@@ -85,6 +85,7 @@ let auChunks = [];          // NAL units of the current access unit, including s
 let auHasVCL = false;
 let auIsKey = false;
 let lastKeyAU = null;       // keyframe for instant start of new clients
+let crashInfo = null;       // last emulator crash (set by MCP watchdog via /crash)
 const START_CODE = Buffer.from([0, 0, 1]);
 
 function clientsByCodec(codec) {
@@ -95,6 +96,12 @@ function clientsByCodec(codec) {
 
 function broadcastH264(msg) {
   for (const ws of clientsByCodec('h264')) ws.send(msg);
+}
+
+function broadcastCrash(info) {
+  crashInfo = info;
+  const msg = JSON.stringify({ type: 'crash', ...info });
+  for (const ws of clients) if (ws.readyState === 1) ws.send(msg);
 }
 
 function adb(args) {
@@ -945,7 +952,23 @@ try {
       port: PORT,
       resolution: curRes,
       version: cachedVersion ? cachedVersion.trim() : null,
+      crash: crashInfo,
     });
+    return;
+  }
+  if (pathname === '/crash') {
+    // called by the MCP watchdog when the emulator it owns crashes
+    const p = url.searchParams;
+    const info = {
+      reason: p.get('reason') || 'emulator crashed',
+      restart: parseInt(p.get('restart') || '0', 10),
+      max: parseInt(p.get('max') || '0', 10),
+      ts: parseInt(p.get('ts') || String(Date.now()), 10),
+      givingUp: p.get('giving') === '1',
+    };
+    console.log(`[bridge] crash reported: ${info.reason} (restart ${info.restart}/${info.max})`);
+    broadcastCrash(info);
+    json(res, 200, { ok: true });
     return;
   }
   res.writeHead(404);

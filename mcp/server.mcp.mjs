@@ -527,6 +527,92 @@ const ensureRelayUp = async () => {
   return { started: true };
 };
 
+// --- emulator crash watchdog: auto-restart a dead emulator we own ---
+// The bridge (web/server.js) only re-adopts a device that reappears; it cannot
+// bring a crashed qemu back. This watchdog closes that gap: it notices our
+// emulator process died (not a user env_stop), restarts it with the original
+// args, and reports the crash to the bridge so the browser shows a status.
+// Crash-loop guard: after MAX auto-restarts within a window we stop and log.
+const WATCHDOG = {
+  maxRestarts: parseInt(process.env.EMU_AUTO_RESTART_MAX || '5', 10),
+  windowMs: parseInt(process.env.EMU_AUTO_RESTART_WINDOW_MS || '300000', 10),
+  pollMs: 3000,
+};
+let watchdogTimer = null;
+let lastCrashLog = null;
+let autoRestartCount = 0;
+let autoRestartWindowStart = 0;
+const emuInfo = { avd: null, args: null, env: null, bootLog: null };
+
+const tailEmuLog = (n = 25) => {
+  try {
+    const buf = fs.readFileSync(emuInfo.bootLog);
+    return buf.toString().split('\n').filter(Boolean).slice(-n).join('\n');
+  } catch { return ''; };
+};
+
+const notifyBridgeCrash = async (info) => {
+  try {
+    await relayJson(`/crash?reason=${encodeURIComponent(info.reason)}&restart=${info.restart}&max=${info.max}&ts=${Date.now()}&giving=${info.givingUp ? '1' : '0'}`);
+  } catch { /* bridge down — the crash.log still has it */ };
+};
+
+const watchdogArm = () => {
+  if (watchdogTimer) return;
+  watchdogTimer = setInterval(checkEmuCrash, WATCHDOG.pollMs);
+  if (watchdogTimer.unref) watchdogTimer.unref();
+};
+
+const watchdogDisarm = () => {
+  if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; };
+};
+
+const autoRestartReset = () => { autoRestartCount = 0; autoRestartWindowStart = 0; };
+
+const checkEmuCrash = async () => {
+  if (startGate) return; // an env_start/env_stop is in progress — don't race it
+  if (!emuInfo.avd) return;
+  const pid = fetchPid('emulator');
+  if (pid && processAlive(pid)) return; // alive — nothing to do
+
+  // dead. Only auto-restart an emulator WE launched (a pidfile with its avd).
+  let cmdline = pid ? await readProcCmdline(pid) : '';
+  if (pid && cmdline && !cmdline.includes('-avd')) return; // external / already handled
+  if (cmdline.includes('-avd') && cmdline.match(/-avd\s+(\S+)/)?.[1] !== emuInfo.avd) return; // not our avd
+
+  const reason = `emulator process died (pid ${pid || 'n/a'})`;
+  const crashLog = tailEmuLog();
+
+  // crash-loop guard
+  const now = Date.now();
+  if (autoRestartWindowStart && now - autoRestartWindowStart > WATCHDOG.windowMs) {
+    autoRestartCount = 0; autoRestartWindowStart = now;
+  }
+  autoRestartWindowStart = autoRestartWindowStart || now;
+  autoRestartCount += 1;
+  const givingUp = autoRestartCount > WATCHDOG.maxRestarts;
+
+  lastCrashLog = { ts: now, reason, crashLog, restart: autoRestartCount, max: WATCHDOG.maxRestarts, givingUp };
+  // persist: survives an MCP restart, readable by a human / the agent
+  try { fs.writeFileSync(path.join(dataDir(), 'crash.log'), JSON.stringify(lastCrashLog, null, 2)); } catch {}
+  console.error(`[watchdog] ${reason} — auto-restart ${autoRestartCount}/${WATCHDOG.maxRestarts}${givingUp ? ' (giving up)' : ''}`);
+  await notifyBridgeCrash(lastCrashLog);
+
+  if (givingUp) { watchdogDisarm(); return; }
+
+  // clean up the dead process + stale AVD locks, then respawn with the original args
+  if (pid) { try { await terminateTree(pid, '-avd'); } catch {}; dropPid('emulator'); }
+  if (emuInfo.avd) { purgeAvdLocks(emuInfo.avd); await pause(1000); }
+  try {
+    const child = launchDetached(emulatorExecutable(), emuInfo.args, { env: emuInfo.env || {}, logName: 'emulator.log' });
+    persistPid('emulator', child.pid);
+    console.error(`[watchdog] emulator restarted (pid ${child.pid})`);
+  } catch (e) {
+    console.error('[watchdog] restart failed:', e.message);
+    autoRestartCount += 1; // count the failure against the guard too
+  }
+};
+
 // --- polling the state of the Android device ---
 
 const relayJson = async (pathname) => {
@@ -656,11 +742,9 @@ mcp.registerTool(
           ...EMU_APPEND_ARGS.split(/\s+/).filter(Boolean),
         ];
         const bootLog = path.join(dataDir(), 'emulator.log');
+        const emuEnv = { ANDROID_HOME: process.env.ANDROID_HOME || path.dirname(path.dirname(ADB_EXEC)) };
         const spawnEmulator = () => {
-          const child = launchDetached(emulatorExecutable(), args, {
-            env: { ANDROID_HOME: process.env.ANDROID_HOME || path.dirname(path.dirname(ADB_EXEC)) },
-            logName: 'emulator.log',
-          });
+          const child = launchDetached(emulatorExecutable(), args, { env: emuEnv, logName: 'emulator.log' });
           persistPid('emulator', child.pid);
           return child;
         };
@@ -689,6 +773,10 @@ mcp.registerTool(
           await pause(1500);
         }
         await awaitBoot(BOOT_DEADLINE_MS, extra);
+        // remember how we launched it so the watchdog can restart it on a crash
+        Object.assign(emuInfo, { avd: avdName, args, env: emuEnv, bootLog });
+        autoRestartReset();
+        watchdogArm();
       }
 
       let scrcpyWarning = null;
@@ -723,6 +811,10 @@ mcp.registerTool(
   async (_, extra) => {
     try {
       assertNotAborted(extra, 'env_stop');
+      // stop the crash watchdog so it doesn't resurrect an intentionally-stopped emulator
+      watchdogDisarm();
+      autoRestartReset();
+      emuInfo.avd = null; emuInfo.args = null; emuInfo.env = null; emuInfo.bootLog = null;
       const stopped = [];
       if (await shutRelay()) stopped.push('bridge');
       else { try { await relayJson('/state'); } catch { stopped.push('bridge (was not reachable)'); } }

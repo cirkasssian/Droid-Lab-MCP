@@ -49,6 +49,13 @@
     color: #fff; font-size: 14px;
   }
   #overlay.show { display: flex; }
+  #crashBanner {
+    position: fixed; top: 0; left: 0; right: 0;
+    background: #b3261e; color: #fff;
+    padding: 8px 14px; font-size: 13px; text-align: center;
+    z-index: 50; display: none; line-height: 1.4;
+  }
+  #crashBanner.show { display: block; }
   .spinner {
     width: 32px; height: 32px;
     border: 3px solid #444; border-top-color: #fff;
@@ -66,6 +73,7 @@
   <span id="resBadge" title="Resolution is adjusted automatically to network bandwidth">auto …</span>
   <span id="fps">— fps</span>
 </header>
+<div id="crashBanner"></div>
 <div id="wrap">
   <canvas id="c" width="486" height="1080"></canvas>
   <button id="fsBtn" title="Fullscreen">⛶</button>
@@ -191,6 +199,7 @@ function handleH264Message(u8) {
     needKey = false;
   }
   if (!decoder) return;
+  if (isKey && crashEl.classList.contains('show')) clearCrash(); // stream recovered after a crash
   try {
     decoder.decode(new EncodedVideoChunk({
       type: isKey ? 'key' : 'delta',
@@ -418,6 +427,19 @@ function onWsJson(d) {
   if (d.type === 'clip' && d.text) {
     navigator.clipboard.writeText(d.text).catch(() => {});
   }
+  if (d.type === 'crash') showCrash(d);
+}
+
+const crashEl = document.getElementById('crashBanner');
+function showCrash(d) {
+  const giving = d.givingUp || d.restart >= d.max;
+  crashEl.textContent = giving
+    ? `⚠ Emulator crashed ${d.restart}× in a row — auto-restart stopped (max ${d.max}). Check bridge.log / run env_start.`
+    : `⚠ Emulator crashed — auto-restart ${d.restart}/${d.max} in progress, waiting for it to come back…`;
+  crashEl.classList.add('show');
+}
+function clearCrash() {
+  if (crashEl.classList.contains('show')) crashEl.classList.remove('show');
 }
 
 // drag&drop APK/files — as in ws-scrcpy
