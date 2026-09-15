@@ -87,7 +87,9 @@ All long operations (boot, image download, APK install, file transfer) support M
 
 ## Tools
 
-42 tools. Status tools (`env_status`, `device_state`, `env_list`, `system_images_list`) also return `structuredContent` (MCP 2025-06-18). All tools declare MCP annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`).
+43 tools. Status tools (`env_status`, `device_state`, `env_list`, `system_images_list`) also return `structuredContent` (MCP 2025-06-18). All tools declare MCP annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`).
+
+Many tools accept a required `confirm: true` argument. It has no functional effect — it exists to prevent a known LLM failure mode: when a tool's arguments are all optional, some models emit a bare `{` (truncated JSON) instead of `{}` for empty calls, which the MCP client rejects with `JSON parsing failed: Text: {`. Requiring `confirm` forces the model to generate a complete `{"confirm":true}` object, eliminating the truncation.
 
 ### Lifecycle
 
@@ -147,6 +149,14 @@ All long operations (boot, image download, APK install, file transfer) support M
 | `access_stop` | Back to loopback; LAN access cut off. |
 | `set_dev_input({enabled})` | Grant / revoke browser input. |
 | `bridge_restart` | Restart the relay process without touching the emulator: applies bridge code changes, recovers a hung/dead bridge. Preserves host binding and input mode; access token regenerates (new URL in the reply). |
+
+### Configuration
+
+| Tool | Description |
+|---|---|
+| `mcp_config({show\|set\|reset\|defaults})` | Read or update the persisted configuration (`~/.local/state/droidlab/config.json`). Options: `port` (bridge listen port, default 8090), `requireToken` (HTTP/WS access token, default true), `defaultAvd` (preferred AVD, default null), `extraArgs` (extra emulator args), `bootTimeoutMs` (boot wait limit, default 120000), `scrcpyVersion` (scrcpy release, default "4.1"). `{show:true}` reads, pass keys to update, `{reset:true}` restores defaults, `{defaults:true}` confirms defaults (silences the first-run prompt). Changes apply on the next bridge restart. |
+
+On the **first `env_start`** (when `config.json` does not exist yet), the reply includes a note offering to customize the defaults via `mcp_config`.
 
 ## Resources
 

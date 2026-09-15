@@ -258,6 +258,40 @@ const pickDefaultAvd = () => {
   throw new Error('AVD not specified: pass avd, set EMU_AVD or add an entry to mcp/emulators.json');
 };
 
+// --- MCP configuration (user-tunable defaults, persisted in the state dir) ---
+
+const CONFIG_PATH = path.join(dataDir(), 'config.json');
+
+const CONFIG_DEFAULTS = {
+  port: 8090,
+  requireToken: true,
+  defaultAvd: null,
+  extraArgs: '',
+  bootTimeoutMs: 120000,
+  scrcpyVersion: '4.1',
+};
+
+const loadConfig = () => {
+  try {
+    const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    return { ...CONFIG_DEFAULTS, ...raw };
+  } catch { return { ...CONFIG_DEFAULTS }; }
+};
+
+const saveConfig = (partial) => {
+  const cur = loadConfig();
+  const next = { ...cur, ...partial };
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2) + '\n');
+  return next;
+};
+
+const isConfigDefaults = (cfg) => {
+  return Object.entries(CONFIG_DEFAULTS).every(([k, v]) => cfg[k] === v);
+};
+
+// The effective port: config file > env var > default.
+const effectivePort = () => loadConfig().port;
+
 // --- relay bridge (web/server.js) ---
 
 const RELAY_STATE = path.join(dataDir(), 'bridge.json');
@@ -285,22 +319,25 @@ const awaitHttpUp = async (url, timeoutMs) => {
 
 const bootRelay = async (host) => {
   try { await ensureScrcpyCached(null); } catch (e) { console.error(`[env] scrcpy bootstrap skipped: ${e.message}`); }
-  const token = crypto.randomBytes(24).toString('hex');
-  const accessToken = crypto.randomBytes(16).toString('hex');
+  const cfg = loadConfig();
+  const port = cfg.port;
+  const token = cfg.requireToken ? crypto.randomBytes(24).toString('hex') : null;
+  const accessToken = cfg.requireToken ? crypto.randomBytes(16).toString('hex') : null;
   const child = launchDetached(process.execPath, [path.join(PROJECT_HOME, 'web', 'server.js')], {
     env: {
       HOST: host,
-      PORT: String(RELAY_PORT),
-      WEB_CONTROL_TOKEN: token,
-      WEB_ACCESS_TOKEN: accessToken,
+      PORT: String(port),
+      ...(token ? { WEB_CONTROL_TOKEN: token } : {}),
+      ...(accessToken ? { WEB_ACCESS_TOKEN: accessToken } : {}),
       ADB: ADB_EXEC,
       ...(scrcpyPathsCache ? { SCRCPY: scrcpyPathsCache.scrcpy, SCRCPY_SERVER: scrcpyPathsCache.server } : {}),
     },
     logName: 'bridge.log',
   });
   persistPid('bridge', child.pid);
-  fs.writeFileSync(RELAY_STATE, JSON.stringify({ token, accessToken, host, port: RELAY_PORT, pid: child.pid }));
-  await awaitHttpUp(`https://127.0.0.1:${RELAY_PORT}/state?token=${encodeURIComponent(accessToken)}`, 15000);
+  fs.writeFileSync(RELAY_STATE, JSON.stringify({ token, accessToken, host, port, pid: child.pid }));
+  const authQ = accessToken ? `?token=${encodeURIComponent(accessToken)}` : '';
+  await awaitHttpUp(`https://127.0.0.1:${port}/state${authQ}`, 15000);
   return child.pid;
 };
 
@@ -335,7 +372,7 @@ const teardownRelay = () => {
 };
 
 const relayEndpoint = (info) => {
-  const port = info?.port || RELAY_PORT;
+  const port = info?.port || effectivePort();
   const token = info?.accessToken ? `?token=${encodeURIComponent(info.accessToken)}` : '';
   return `wss://127.0.0.1:${port}/${token}`;
 };
@@ -377,7 +414,7 @@ const dialRelay = async () => {
       await pause(700);
     }
   }
-  throw new Error(`bridge unavailable at 127.0.0.1:${info?.port || RELAY_PORT} (${lastErr?.message || 'no connection'}) — call env_start`);
+  throw new Error(`bridge unavailable at 127.0.0.1:${info?.port || effectivePort()} (${lastErr?.message || 'no connection'}) — call env_start`);
 };
 
 const queueRelaySend = (sock, obj) => {
@@ -619,7 +656,7 @@ const relayJson = async (pathname) => {
   const info = readRelayState();
   const auth = info?.accessToken ? `${pathname.includes('?') ? '&' : '?'}token=${encodeURIComponent(info.accessToken)}` : '';
   const res = await new Promise((resolve, reject) => {
-    const req = https.get({ host: '127.0.0.1', port: info?.port || RELAY_PORT, path: pathname + auth, timeout: 4000, rejectUnauthorized: false }, resolve);
+    const req = https.get({ host: '127.0.0.1', port: info?.port || effectivePort(), path: pathname + auth, timeout: 4000, rejectUnauthorized: false }, resolve);
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
   });
@@ -700,7 +737,7 @@ const renderStatus = (s) => {
   return lines.join('\n');
 };
 
-const mcp = new McpServer({ name: 'droidlab', version: '1.3.4' });
+const mcp = new McpServer({ name: 'droidlab', version: '1.4.0' });
 
 let startGate = false; // mutex: parallel env_start calls conflict over pidfiles and spawn
 
@@ -793,6 +830,14 @@ mcp.registerTool(
       else parts.push(`Emulator ${avdName} was already running.`);
       if (bridge.started) parts.push('Bridge started on loopback with a token: browser input is disabled until set_dev_input(true).');
       if (scrcpyWarning) parts.push(scrcpyWarning);
+      // first-run: config.json does not exist yet — offer to customize defaults
+      if (!fs.existsSync(CONFIG_PATH)) {
+        const cfg = loadConfig();
+        parts.push('');
+        parts.push('First run: using default configuration (port=' + cfg.port + ', requireToken=' + cfg.requireToken + ').');
+        parts.push('Customize with mcp_config({show:true}) to see all options, or mcp_config({port: 9090, requireToken: false}) to change them.');
+        parts.push('Current defaults are used; pass mcp_config({defaults:true}) to persist them or mcp_config({reset:true}) to restore built-in defaults later.');
+      }
       parts.push(renderStatus(status));
       return replyText(parts.join('\n'));
     } catch (e) { return replyError(e); }
@@ -805,7 +850,7 @@ mcp.registerTool(
   {
     title: 'Stop emulator environment',
     description: 'Stop the bridge, the emulator (adb emu kill, then forcibly). Safe shutdown: processes from pidfiles are verified by cmdline; an external emulator (started not via env_start) is left alone if it is not in a pidfile — except adb emu kill, which by definition targets the emulator.',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -885,7 +930,7 @@ mcp.registerTool(
   {
     title: 'Environment status',
     description: 'Environment status: processes (bridge/emulator), the device (boot, Android version, screen, foreground app), input mode, bridge address.',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       summary: z.string(),
@@ -929,7 +974,7 @@ mcp.registerTool(
   {
     title: 'List emulators',
     description: 'Entries of mcp/emulators.json + all AVDs discovered in the SDK (emulator -list-avds).',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       configured: z.array(z.object({ name: z.string(), avd: z.string(), note: z.string().optional() })),
@@ -1162,7 +1207,7 @@ mcp.registerTool(
   {
     title: 'List Android system images',
     description: 'Android system images: installed (from the SDK directory) and available for download (sdkmanager --list).',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       installed: z.array(z.string()),
@@ -1267,7 +1312,7 @@ mcp.registerTool(
   {
     title: 'Device screenshot',
     description: 'Screenshot of the device screen at full resolution (adb screencap PNG, ~1080x2400): the full PNG is saved to shots/, and a downscaled JPEG (~720x1600) is returned in the response. Multiply UI coordinates from the downscaled image by 1.5 for tap/swipe (native pixels). ui_dump is faster for exact element coordinates.',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1417,7 +1462,7 @@ mcp.registerTool(
   {
     title: 'Get device clipboard',
     description: 'Read the device clipboard. Note: scrcpy suppresses re-sending UNCHANGED text — if the buffer has not changed since the last read, the response will not arrive within 5s (a note about it is returned; the control channel may also simply be busy). Parallel calls are serialized.',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1741,7 +1786,7 @@ mcp.registerTool(
   {
     title: 'Dump UI hierarchy',
     description: 'Tree of visible UI elements (uiautomator dump): class, text/content-desc, resource-id, clickable/scrollable, bounds + element center in native pixels — exact coordinates for tap/swipe without guessing from a screenshot. The full XML is saved to shots/uidump-*.xml.',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1813,7 +1858,7 @@ mcp.registerTool(
   {
     title: 'Device state',
     description: 'Full state: process(es), boot, Android/API version, screen, stream resolution, foreground app, input mode.',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       summary: z.string(),
@@ -1864,7 +1909,7 @@ mcp.registerTool(
   {
     title: 'Enable LAN access',
     description: 'Restart the bridge listening on all interfaces (0.0.0.0) and return a URL for the developer: live video + input in the browser (input — after set_dev_input(true)). Access is protected by an access token (generated at bridge start, passed in the URL). The input mode after the restart is reset to "observation".',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1878,7 +1923,7 @@ mcp.registerTool(
       const urls = [];
       for (const ifaces of Object.values(os.networkInterfaces())) {
         for (const i of ifaces || []) {
-          if (i.family === 'IPv4' && !i.internal) urls.push(`https://${i.address}:${RELAY_PORT}/${accessToken ? `?token=${accessToken}` : ''}`);
+          if (i.family === 'IPv4' && !i.internal) urls.push(`https://${i.address}:${effectivePort()}/${accessToken ? `?token=${accessToken}` : ''}`);
         }
       }
       return replyText([
@@ -1896,13 +1941,13 @@ mcp.registerTool(
   {
     title: 'Disable LAN access',
     description: 'Return the bridge to loopback: access from the developer network is cut off (the stream will break). MCP continues to operate the device.',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
     try {
       await cycleRelay('127.0.0.1');
-      return replyText(`Access closed: the bridge listens on 127.0.0.1:${RELAY_PORT} (local only).`);
+      return replyText(`Access closed: the bridge listens on 127.0.0.1:${effectivePort()} (local only).`);
     } catch (e) { return replyError(e); }
   },
 );
@@ -1912,7 +1957,7 @@ mcp.registerTool(
   {
     title: 'Restart the bridge',
     description: 'Restart the relay/stream process (web/server.js) WITHOUT touching the emulator: applies bridge code changes and recovers a hung or dead bridge (boots one if none is running). Preserves the host binding (loopback / 0.0.0.0) and the developer-input mode; the access token is regenerated — hand the new URL from the reply to the developer. The browser video stream reconnects on page reload.',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -1934,12 +1979,12 @@ mcp.registerTool(
       if (state.host === '0.0.0.0') {
         for (const ifaces of Object.values(os.networkInterfaces())) {
           for (const i of ifaces || []) {
-            if (i.family === 'IPv4' && !i.internal) urls.push(`https://${i.address}:${RELAY_PORT}/${accessToken ? `?token=${accessToken}` : ''}`);
+            if (i.family === 'IPv4' && !i.internal) urls.push(`https://${i.address}:${effectivePort()}/${accessToken ? `?token=${accessToken}` : ''}`);
           }
         }
       }
       return replyText([
-        `Bridge restarted (pid ${fetchPid('bridge')}), listening on ${state.host}:${RELAY_PORT}.`,
+        `Bridge restarted (pid ${fetchPid('bridge')}), listening on ${state.host}:${effectivePort()}.`,
         ...(urls.length ? ['New developer URL (token regenerated):', ...urls.map((u) => `- ${u}`)] : []),
         inputNote,
       ].join('\n'));
@@ -1972,7 +2017,7 @@ mcp.registerTool(
       const auth = info?.accessToken ? `&token=${encodeURIComponent(info.accessToken)}` : '';
       const res = await new Promise((resolve, reject) => {
         const req = https.request(
-          { host: '127.0.0.1', port: RELAY_PORT, path: `/resolution?name=${encodeURIComponent(name)}${auth}`, method: 'POST', timeout: 8000, rejectUnauthorized: false },
+          { host: '127.0.0.1', port: effectivePort(), path: `/resolution?name=${encodeURIComponent(name)}${auth}`, method: 'POST', timeout: 8000, rejectUnauthorized: false },
           resolve,
         );
         req.on('error', reject);
@@ -1997,7 +2042,7 @@ mcp.registerTool(
   {
     title: 'Reboot Android emulator',
     description: 'Reboot the device (adb reboot). App state is preserved (not a cold boot). Waits for boot ~120s (supports cancellation and progress). The bridge and the stream are restored automatically.',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -2031,7 +2076,7 @@ mcp.registerTool(
   {
     title: 'Restart adb server',
     description: 'Restart the local adb server (adb kill-server + adb start-server): helps when adb is wedged — the device disappeared from `adb devices`, is stuck in offline/unauthorized, or port 5037 is held by a stale server. Connections and `adb reverse` tunnels drop for a few seconds; the bridge detects the loss and restarts its streams automatically once the device is back. The emulator, device state and files are NOT affected (this is not a device reboot — see reboot_emulator).',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -2140,7 +2185,7 @@ mcp.registerTool(
   {
     title: 'Collect Android bugreport',
     description: 'Collect a full Android bug report (adb bugreport → zip in shots/): device state, logs, dumpsys for all services. Takes 1–3 minutes. Use for deep diagnostics when logcat/shell are not enough. Returns the local zip path.',
-    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   async (_, extra) => {
@@ -2268,6 +2313,73 @@ mcp.registerTool(
   },
 );
 
+// --- configuration (persisted defaults for the bridge + MCP) ---
+
+mcp.registerTool(
+  'mcp_config',
+  {
+    title: 'Get/set MCP configuration',
+    description: 'Read or update the persisted droidlab configuration (state dir/config.json). Options: port (bridge listen port, default 8090), requireToken (HTTP/WS access token, default true), defaultAvd (preferred AVD name, default null = first in emulators.json), extraArgs (extra emulator args, default ""), bootTimeoutMs (boot wait limit, default 120000), scrcpyVersion (scrcpy release, default "4.1"). Call with {show:true} to read all values, or pass keys to update (e.g. {port:9090}). {reset:true} restores built-in defaults. {defaults:true} persists the current defaults (marks config as user-confirmed, silences the first-run prompt). Changes apply on the next bridge start (bridge_restart or env_start).',
+    inputSchema: {
+      show: z.boolean().optional().describe('true — return the current configuration'),
+      reset: z.boolean().optional().describe('true — restore built-in defaults and delete config.json'),
+      defaults: z.boolean().optional().describe('true — persist the current defaults (marks config as user-confirmed)'),
+      port: z.number().int().min(1).max(65535).optional().describe('Bridge listen port (default 8090)'),
+      requireToken: z.boolean().optional().describe('Require an access token for HTTP/WS (default true)'),
+      defaultAvd: z.string().nullable().optional().describe('Preferred AVD name (default null = first in emulators.json)'),
+      extraArgs: z.string().optional().describe('Extra emulator arguments (default "")'),
+      bootTimeoutMs: z.number().int().min(5000).max(600000).optional().describe('Boot wait limit in ms (default 120000)'),
+      scrcpyVersion: z.string().optional().describe('scrcpy release to download (default "4.1")'),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    outputSchema: {
+      config: z.object({
+        port: z.number(),
+        requireToken: z.boolean(),
+        defaultAvd: z.string().nullable(),
+        extraArgs: z.string(),
+        bootTimeoutMs: z.number(),
+        scrcpyVersion: z.string(),
+      }),
+      file: z.string(),
+      note: z.string().optional(),
+    },
+  },
+  async (args) => {
+    try {
+      const { show, reset, defaults, ...updates } = args;
+
+      if (reset) {
+        try { fs.unlinkSync(CONFIG_PATH); } catch {}
+        const cfg = { ...CONFIG_DEFAULTS };
+        return {
+          content: [{ type: 'text', text: `Configuration reset to built-in defaults.\n${JSON.stringify(cfg, null, 2)}\nFile: ${CONFIG_PATH}` }],
+          structuredContent: { config: cfg, file: CONFIG_PATH, note: 'reset to defaults; changes apply on next bridge restart' },
+        };
+      }
+
+      const hasUpdate = Object.keys(updates).length > 0;
+      if (hasUpdate || defaults) {
+        const cfg = saveConfig(hasUpdate ? updates : {});
+        return {
+          content: [{ type: 'text', text: `Configuration ${hasUpdate ? 'updated' : 'persisted (defaults confirmed)'}.\n${JSON.stringify(cfg, null, 2)}\nFile: ${CONFIG_PATH}\nChanges apply on the next bridge restart (bridge_restart or env_start).` }],
+          structuredContent: { config: cfg, file: CONFIG_PATH, note: hasUpdate ? 'updated; changes apply on next bridge restart' : 'defaults confirmed; first-run prompt silenced' },
+        };
+      }
+
+      // show (or no-arg) — return current config
+      const cfg = loadConfig();
+      const exists = fs.existsSync(CONFIG_PATH);
+      return {
+        content: [{ type: 'text', text: exists
+          ? `Current configuration (${CONFIG_PATH}):\n${JSON.stringify(cfg, null, 2)}`
+          : `No config file yet — using built-in defaults:\n${JSON.stringify(cfg, null, 2)}\nCall mcp_config({defaults:true}) to confirm these defaults, or pass keys to customize.` }],
+        structuredContent: { config: cfg, file: CONFIG_PATH, note: exists ? 'persisted' : 'defaults (no config file yet)' },
+      };
+    } catch (e) { return replyError(e); }
+  },
+);
+
 // --- MCP resources (state, screenshots) ---
 
 mcp.registerResource(
@@ -2343,7 +2455,7 @@ mcp.registerResource(
 const entrypoint = async () => {
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
-  console.error(`[droidlab-mcp] ready (bridge port ${RELAY_PORT}, state: ${dataDir()})`);
+  console.error(`[droidlab-mcp] ready (bridge port ${effectivePort()}, state: ${dataDir()})`);
 };
 
 entrypoint().catch((e) => {

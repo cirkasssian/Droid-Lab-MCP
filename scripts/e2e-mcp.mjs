@@ -86,9 +86,10 @@ async function main() {
     'install_apk', 'push_file', 'pull_file', 'open_app', 'close_app', 'app_list', 'ui_dump',
     'wait_for', 'deep_link', 'app_permission',
     'logcat', 'device_state', 'access_start', 'access_stop', 'set_dev_input', 'set_resolution',
-    'shell', 'emu', 'bugreport', 'app_uninstall', 'app_clear_data', 'bridge_logs', 'pinch', 'set_orientation', 'bridge_restart'];
+    'shell', 'emu', 'bugreport', 'app_uninstall', 'app_clear_data', 'bridge_logs', 'pinch', 'set_orientation', 'bridge_restart',
+    'mcp_config'];
   const missing = expected.filter((t) => !tools.tools.some((x) => x.name === t));
-  check('mcp: tools/list (42 tools)', missing.length === 0, missing.length ? `missing: ${missing.join(',')}` : 'all present');
+  check('mcp: tools/list (43 tools)', missing.length === 0, missing.length ? `missing: ${missing.join(',')}` : 'all present');
 
   // --- annotations (MCP standard: hints for client UIs) ---
   const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -98,7 +99,7 @@ async function main() {
   check('annotations: all tools have hints', unannotated.length === 0, unannotated.map((t) => t.name).join(',') || 'ok');
 
   // --- structuredContent (MPC 2025-06-18) ---
-  const stEnv = await client.callTool({ name: 'env_status', arguments: {} });
+  const stEnv = await client.callTool({ name: 'env_status', arguments: { confirm: true } });
   check('env_status: structuredContent', !!stEnv.structuredContent?.processes && !!stEnv.structuredContent?.adb,
     stEnv.structuredContent ? 'processes+adb ok' : 'no structuredContent');
 
@@ -123,7 +124,7 @@ async function main() {
 
   // --- screenshot ---
   const before = newestShot();
-  const shot = await client.callTool({ name: 'screenshot', arguments: {} });
+  const shot = await client.callTool({ name: 'screenshot', arguments: { confirm: true } });
   const img = (shot.content || []).find((c) => c.type === 'image');
   const shotText = (shot.content || []).find((c) => c.type === 'text')?.text || '';
   const afterShot = newestShot();
@@ -136,15 +137,15 @@ async function main() {
 
   // --- tap changes the screen: deterministically — via a clickable element from ui_dump (after open_app) ---
   async function tapByUiDump() {
-    await client.callTool({ name: 'screenshot', arguments: {} });
+    await client.callTool({ name: 'screenshot', arguments: { confirm: true } });
     const before = newestShot();
     const h1 = before ? crypto.createHash('md5').update(fs.readFileSync(before)).digest('hex') : null;
-    const uidTap = await client.callTool({ name: 'ui_dump', arguments: {} });
+    const uidTap = await client.callTool({ name: 'ui_dump', arguments: { confirm: true } });
     const m = ((uidTap.content || []).map((c) => c.text || '').join('\n')).match(/\[click\] center\((\d+),(\d+)\)/);
     if (!m) return check('tap: screen changed (input works)', false, 'ui_dump found no clickable element');
     const tr = await client.callTool({ name: 'tap', arguments: { x: +m[1], y: +m[2] } });
     await new Promise((r) => setTimeout(r, 1500));
-    await client.callTool({ name: 'screenshot', arguments: {} });
+    await client.callTool({ name: 'screenshot', arguments: { confirm: true } });
     const after = newestShot();
     const h2 = after ? crypto.createHash('md5').update(fs.readFileSync(after)).digest('hex') : null;
     check('tap: screen changed (input works)', !tr.isError && before !== after && h1 !== h2, `tap ${m[1]},${m[2]}: ${h1?.slice(0, 8)} → ${h2?.slice(0, 8)}`);
@@ -162,7 +163,7 @@ async function main() {
   const setRes = await client.callTool({ name: 'clipboard_set', arguments: { text: secret } });
   check('clipboard_set: accepted by the control channel', !setRes.isError, (setRes.content?.[0]?.text || '').slice(0, 60));
   await new Promise((r) => setTimeout(r, 400));
-  const clip = await client.callTool({ name: 'clipboard_get', arguments: {} });
+  const clip = await client.callTool({ name: 'clipboard_get', arguments: { confirm: true } });
   const clipText = (clip.content?.[0]?.text || '');
   check('clipboard_get: response (text or documented suppression)',
     clipText.length > 0 && (clipText.includes(secret) || /has not changed|not (changed|been changed)/.test(clipText)), clipText.slice(0, 80));
@@ -174,7 +175,7 @@ async function main() {
   await tapByUiDump();
 
   // --- device_state ---
-  const st = await client.callTool({ name: 'device_state', arguments: {} });
+  const st = await client.callTool({ name: 'device_state', arguments: { confirm: true } });
   check('device_state: boot+version+screen', /Android \d/.test(st.content?.[0]?.text || '') && /screen/.test(st.content?.[0]?.text || ''), (st.content?.[0]?.text || '').split('\n').slice(-2).join(' | '));
   check('device_state: structuredContent', !!st.structuredContent?.adb?.booted, 'ok');
 
@@ -186,7 +187,7 @@ async function main() {
   const appsAllText = appsAll.content?.[0]?.text || '';
   check('app_list(system): system included (settings)', !appsAll.isError && /com\.android\.settings/.test(appsAllText), appsAllText.split('\n')[0]);
 
-  const uid = await client.callTool({ name: 'ui_dump', arguments: {} });
+  const uid = await client.callTool({ name: 'ui_dump', arguments: { confirm: true } });
   const uidText = uid.content?.[0]?.text || '';
   check('ui_dump: tree with centers', !uid.isError && /center\(\d+,\d+\)/.test(uidText), uidText.split('\n')[1]?.slice(0, 80) || uidText.slice(0, 80));
   check('ui_dump: xml saved to shots/', /uidump-.*\.xml/.test(uidText));
@@ -231,7 +232,7 @@ async function main() {
 
 
   // --- access + input-mode ---
-  const acc = await client.callTool({ name: 'access_start', arguments: {} });
+  const acc = await client.callTool({ name: 'access_start', arguments: { confirm: true } });
   const accText = acc.content?.[0]?.text || '';
   const s1 = await httpState();
   check('access_start: bridge on 0.0.0.0 + URL', !acc.isError && s1.body?.host === '0.0.0.0' && /https:\/\/\d+\./.test(accText), `host=${s1.body?.host}`);
@@ -264,13 +265,13 @@ async function main() {
   const s4 = await httpState();
   check('rogue client: got observation mode, cannot flip', rogue === false && s4.body?.inputEnabled === false, `mode=${rogue}, state=${s4.body?.inputEnabled}`);
 
-  await client.callTool({ name: 'access_stop', arguments: {} });
+  await client.callTool({ name: 'access_stop', arguments: { confirm: true } });
   const s5 = await httpState();
   check('access_stop: back to loopback', s5.body?.host === '127.0.0.1', `host=${s5.body?.host}`);
 
   // --- bridge_restart (preserves host binding, regenerates token, new pid) ---
   const pidBefore = bridgeInfo()?.pid;
-  const br = await client.callTool({ name: 'bridge_restart', arguments: {} });
+  const br = await client.callTool({ name: 'bridge_restart', arguments: { confirm: true } });
   const pidAfter = bridgeInfo()?.pid;
   const s6 = await httpState();
   check('bridge_restart: bridge up on new pid', !br.isError && !!pidBefore && !!pidAfter && pidBefore !== pidAfter && s6.body?.host === '127.0.0.1', `pid ${pidBefore} → ${pidAfter}, host=${s6.body?.host}`);
@@ -287,6 +288,23 @@ async function main() {
     const res2 = await client.readResource({ uri: `droidlab://shots/${shotName}` });
     check('resource template: shots/{name} (png blob)', !!res2.contents?.[0]?.blob, shotName);
   } catch (e) { check('resource template: shots/{name} (png blob)', false, e.message); }
+
+  // --- mcp_config: show, set, reset ---
+  const cfgShow = await client.callTool({ name: 'mcp_config', arguments: { show: true } });
+  const cfgShowText = (cfgShow.content || []).map((c) => c.text || '').join('\n');
+  check('mcp_config: show returns config', !cfgShow.isError && /"port":/.test(cfgShowText) && /"requireToken":/.test(cfgShowText), cfgShowText.split('\n')[0]?.slice(0, 60) || '');
+
+  const cfgSet = await client.callTool({ name: 'mcp_config', arguments: { port: 9999 } });
+  const cfgSetText = (cfgSet.content || []).map((c) => c.text || '').join('\n');
+  check('mcp_config: set port=9999', !cfgSet.isError && /"port": 9999/.test(cfgSetText), cfgSetText.split('\n')[0]?.slice(0, 60) || '');
+
+  const cfgVerify = await client.callTool({ name: 'mcp_config', arguments: { show: true } });
+  const cfgVerifyText = (cfgVerify.content || []).map((c) => c.text || '').join('\n');
+  check('mcp_config: port=9999 persisted', /"port": 9999/.test(cfgVerifyText));
+
+  const cfgReset = await client.callTool({ name: 'mcp_config', arguments: { reset: true } });
+  const cfgResetText = (cfgReset.content || []).map((c) => c.text || '').join('\n');
+  check('mcp_config: reset to defaults (port=8090)', !cfgReset.isError && /"port": 8090/.test(cfgResetText), cfgResetText.split('\n')[0]?.slice(0, 60) || '');
 
   // --- auto-restore: video stream survives an emulator crash (ensureDeviceWatch) ---
   // Only when we own the lifecycle (we booted it ourselves), so we don't kill a pre-running emulator.
@@ -368,16 +386,16 @@ async function main() {
   }
 
   // --- adb_restart: adb server restart; the emulator keeps running and must come back ---
-  const adbR = await client.callTool({ name: 'adb_restart', arguments: {} });
+  const adbR = await client.callTool({ name: 'adb_restart', arguments: { confirm: true } });
   const adbRText = (adbR.content || []).map((c) => c.text || '').join('\n');
   check('adb_restart: device back after server restart', !adbR.isError && /Device back: emulator-/.test(adbRText), adbRText.split('\n').slice(1, 2).join(' | '));
-  const stAfterAdb = await client.callTool({ name: 'env_status', arguments: {} });
+  const stAfterAdb = await client.callTool({ name: 'env_status', arguments: { confirm: true } });
   const stAfterAdbText = stAfterAdb.content?.[0]?.text || '';
   check('adb_restart: env_status healthy afterwards', !stAfterAdb.isError && /device: emulator-/.test(stAfterAdbText), stAfterAdbText.split('\n').find((l) => l.startsWith('device:')) || '');
 
   // --- lifecycle down (only if we started it) ---
   if (!emulatorWasRunning) {
-    const stop = await client.callTool({ name: 'env_stop', arguments: {} });
+    const stop = await client.callTool({ name: 'env_stop', arguments: { confirm: true } });
     check('env_stop: stopped', !stop.isError, (stop.content?.[0]?.text || '').split('\n').slice(0, 4).join(' | '));
     const postDevs = await adbDevicesRaw();
     check('env_stop: emulator gone from adb', !/emulator-\d+\s+device/.test(postDevs));
