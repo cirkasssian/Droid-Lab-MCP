@@ -87,7 +87,7 @@ All long operations (boot, image download, APK install, file transfer) support M
 
 ## Tools
 
-43 tools. Status tools (`env_status`, `device_state`, `env_list`, `system_images_list`) also return `structuredContent` (MCP 2025-06-18). All tools declare MCP annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`).
+44 tools. Status tools (`env_status`, `device_state`, `env_list`, `system_images_list`, `list_devices`) also return `structuredContent` (MCP 2025-06-18). All tools declare MCP annotations (`readOnlyHint` / `destructiveHint` / `idempotentHint`).
 
 Many tools accept a required `confirm: true` argument. It has no functional effect — it exists to prevent a known LLM failure mode: when a tool's arguments are all optional, some models emit a bare `{` (truncated JSON) instead of `{}` for empty calls, which the MCP client rejects with `JSON parsing failed: Text: {`. Requiring `confirm` forces the model to generate a complete `{"confirm":true}` object, eliminating the truncation.
 
@@ -98,7 +98,7 @@ Many tools accept a required `confirm: true` argument. It has no functional effe
 | `env_start({avd?})` | Emulator (cold boot, device state is lost on stop) + bridge on loopback. Idempotent (accepts an already-running external emulator), mutex-protected. |
 | `env_stop` | Graceful shutdown → verified kill → stale-lock removal. |
 | `env_status` | Processes (bridge/emulator), boot state, device info, input mode. |
-| `env_list` | Entries of `mcp/emulators.json` + all AVDs discovered in the SDK. |
+| `env_list` | Entries of the emulator registry + all AVDs discovered in the SDK. |
 | `reboot_emulator` | `adb reboot` with a boot wait (~120 s); app state is preserved. |
 | `adb_restart` | Restart the local adb server (kill-server + start-server) — for a wedged adb: device gone from `adb devices`, stuck `offline`/`unauthorized`, stale port-5037 server. Streams recover automatically; not a device reboot. |
 
@@ -108,7 +108,8 @@ Many tools accept a required `confirm: true` argument. It has no functional effe
 |---|---|
 | `system_images_list` | Installed system images + ones available for download. |
 | `system_image_install({package})` | `sdkmanager --install` (30 min cap, cancellable, progress). |
-| `avd_create({name, package, alias?})` | `avdmanager create avd` (pixel_7 profile) + a record in `emulators.json`. |
+| `avd_create({name, package, device?, alias?})` | `avdmanager create avd` (default pixel_7 profile) + a record in the emulator registry. `device` selects the hardware profile (pixel_tablet, nexus_7, …). |
+| `list_devices` | Available device profiles (`avdmanager list device`): id, name, type. |
 
 ### Device interaction
 
@@ -147,14 +148,14 @@ Many tools accept a required `confirm: true` argument. It has no functional effe
 |---|---|
 | `access_start` | Bridge → `0.0.0.0`; returns a LAN URL with an access token. |
 | `access_stop` | Back to loopback; LAN access cut off. |
-| `set_dev_input({enabled})` | Grant / revoke browser input. |
+| `set_dev_input({enabled})` | Grant / revoke browser input. The setting is persisted to `config.json` and restored on the next bridge restart. |
 | `bridge_restart` | Restart the relay process without touching the emulator: applies bridge code changes, recovers a hung/dead bridge. Preserves host binding and input mode; access token regenerates (new URL in the reply). |
 
 ### Configuration
 
 | Tool | Description |
 |---|---|
-| `mcp_config({show\|set\|reset\|defaults})` | Read or update the persisted configuration (`~/.local/state/droidlab/config.json`). Options: `port` (bridge listen port, default 8090), `requireToken` (HTTP/WS access token, default true), `defaultAvd` (preferred AVD, default null), `extraArgs` (extra emulator args), `bootTimeoutMs` (boot wait limit, default 120000), `scrcpyVersion` (scrcpy release, default "4.1"). `{show:true}` reads, pass keys to update, `{reset:true}` restores defaults, `{defaults:true}` confirms defaults (silences the first-run prompt). Changes apply on the next bridge restart. |
+| `mcp_config({show\|set\|reset\|defaults})` | Read or update the persisted configuration (`~/.local/state/droidlab/config.json`). Options: `port` (bridge listen port, default 8090), `requireToken` (HTTP/WS access token, default true), `defaultAvd` (preferred AVD, default null), `extraArgs` (extra emulator args), `bootTimeoutMs` (boot wait limit, default 120000), `scrcpyVersion` (scrcpy release, default "4.1"), `inputEnabled` (browser input enabled by default after bridge start, default false). `{show:true}` reads, pass keys to update, `{reset:true}` restores defaults, `{defaults:true}` confirms defaults (silences the first-run prompt). Changes apply on the next bridge restart. |
 
 On the **first `env_start`** (when `config.json` does not exist yet), the reply includes a note offering to customize the defaults via `mcp_config`.
 
@@ -187,14 +188,15 @@ ssh -L 8090:localhost:8090 user@headless -N
 # then: https://localhost:8090/?token=<accessToken> (localhost is a secure context — no cert warning)
 ```
 
-Browser controls: click = tap, drag = swipe, wheel = scroll, keyboard = device input (printable text, Backspace, Enter, arrows, Esc), plus Back / Home / Recents / fullscreen buttons and a sound toggle (device audio is streamed as opus; the browser starts muted — autoplay policy). APKs can be dragged into the window (`adb install -r -t`); other dropped files land in `/sdcard/Download/`. Ctrl+C / Ctrl+V bridge the host clipboard with the device.
+Browser controls: click = tap, drag = swipe, wheel = scroll, keyboard = device input (printable text, Backspace, Enter, arrows, Esc), plus Back / Home / Recents / fullscreen buttons and a sound toggle (device audio is streamed as opus; the browser starts muted — autoplay policy). APKs can be dragged into the window (`adb install -r -t`); other dropped files land in `/sdcard/Download/`. Ctrl+C / Ctrl+V bridge the host clipboard with the device. Touch coordinates are mapped to the device's native screen size (queried via `wm size`), so tablets and phones both work correctly.
 
 ## Architecture
 
 | Component | Path | Purpose |
 |---|---|---|
 | MCP server | `mcp/server.mcp.mjs` | stdio server: emulator lifecycle, input, screenshots, access control |
-| Emulator config | `mcp/emulators.json` | Human-readable AVD names (`android-13` → `API33`) |
+| Emulator registry | `~/.local/state/droidlab/emulators.json` | AVD entries: name, avd, note, device. Migrated from `mcp/emulators.json` on first run (survives repo updates). The repo file is a **seed only** — after migration it is never read again and may drift. |
+| Configuration | `~/.local/state/droidlab/config.json` | Persisted user config: port, requireToken, defaultAvd, inputEnabled, etc. Created on first `mcp_config` or `set_dev_input` call. Survives repo updates. |
 | Web bridge | `web/server.js` | HTTP + WebSocket, scrcpy host (video + audio + control), broadcast |
 | Frontend | `web/index.html` | Canvas rendering (WebCodecs), input, FPS, audio |
 | Launcher | `web/bridge.py` | Runs `server.js` with millisecond logging |
@@ -213,6 +215,8 @@ If the emulator dies, the bridge restores the stream automatically once the devi
 
 - **TLS.** The bridge serves HTTPS with a self-signed cert (generated on first start, cached in `~/.local/state/droidlab/`). WebCodecs requires a secure context — plain HTTP hides `VideoDecoder`. Accept the cert warning once per browser.
 - **Tokens.** The bridge requires an access token (`WEB_ACCESS_TOKEN`, generated per bridge start): HTTP and WS without `?token=` get `401`. Browser input is gated by a separate `WEB_CONTROL_TOKEN`, so an observer cannot unlock input by itself. A manual start without `WEB_ACCESS_TOKEN` runs unauthenticated (trusted LAN only).
+- **Privileged actions.** APK install / file push is not available to observers: when `WEB_CONTROL_TOKEN` is set, `/push` additionally requires `ctoken=<WEB_CONTROL_TOKEN>` — use the MCP `install_apk`/`push_file` tools instead. Without `WEB_CONTROL_TOKEN` (manual mode) the browser drag&drop works as before.
+- **Hardened input path.** WS input messages are rate-limited (200 msg/s per connection) and every coordinate/keycode is validated as a finite number before it can reach adb; token comparisons are constant-time (`crypto.timingSafeEqual`).
 - **Role separation.** The agent works through MCP; the developer watches (and taps only after `set_dev_input(true)`). While the agent works, browser input is blocked server-side.
 - **No shell injection surface.** No raw `adb shell` tool; the network surface is one port with token auth.
 
@@ -230,7 +234,7 @@ Environment variables (all optional):
 | `ADB` | per-OS SDK path | adb binary |
 | `SCRCPY_SERVER` | `~/bin/scrcpy/*/scrcpy-server` | Server jar for the raw host |
 | `EMU_BIN` | SDK `emulator/emulator` | Emulator binary |
-| `EMU_AVD` | first entry of `mcp/emulators.json` | Default AVD |
+| `EMU_AVD` | first entry of the emulator registry | Default AVD |
 | `EMU_EXTRA_ARGS` | — | Extra emulator arguments |
 | `BOOT_TIMEOUT_MS` | `120000` | Boot wait limit |
 | `BRIDGE_PORT` | `8090` | Bridge port controlled by the MCP |
@@ -241,7 +245,7 @@ Environment variables (all optional):
 | `ABR_COOLDOWN_SECS` | `10` | Minimum interval between switches |
 | `ABR_CHECK_MS` | `2000` | Backlog check period |
 
-End-to-end test: `npm run e2e:mcp` (boots the stack, exercises the toolset over real MCP stdio).
+End-to-end test: `npm run e2e:mcp` (boots the stack, exercises the toolset over real MCP stdio). CI runs a lighter smoke test on every push (`node scripts/check-tools.mjs` — tools/list + annotations, no emulator needed; see `.github/workflows/ci.yml`).
 
 ## WebSocket protocol
 
@@ -280,7 +284,8 @@ A resolution switch does not flicker: the scrcpy video host restarts with the ne
 
 ## Troubleshooting
 
-- **A system image does not boot** — some images are finicky about the host virtualization stack; if one fails to reach `sys.boot_completed`, try another API level (API 33 is a stable default; `emulators.json` carries per-AVD notes).
+- **A system image does not boot** — some images are finicky about the host virtualization stack; if one fails to reach `sys.boot_completed`, try another API level (API 33 is a stable default; the emulator registry carries per-AVD notes).
+- **Old API levels (14–19, 27) fail self-bootstrap on x86_64 hosts** — `ensureAvd` derives the ABI from host arch (`x86_64`) but those API levels only have `google_apis/x86` (32-bit) images. Create the AVD manually via `avd_create` with an `x86` package, or set a `device` profile that matches.
 - **Native H.264 (1080×2400) is not real-time** with a software-rendered emulator — by design, see [Latency model](#latency-model).
 - **`env_stop` waits up to 25 s** for a graceful emulator exit before a verified kill; SIGKILL mid-shutdown can wedge qemu in kernel D-state and leave stale AVD locks, which `env_start`/`env_stop` clean up themselves.
 - **Emulator killed externally** (e.g. by the OOM killer) — the MCP watchdog auto-restarts it with the original arguments (guarded: max 5 restarts per 5 min, then it gives up and logs to `crash.log`), and the browser shows a crash banner until the stream recovers.

@@ -19,7 +19,7 @@ import WebSocket from 'ws';
 
 const PROJECT_HOME = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CAPTURES_DIR = path.join(PROJECT_HOME, 'shots');
-const EMULATOR_REGISTRY = path.join(PROJECT_HOME, 'mcp', 'emulators.json');
+const EMULATOR_REGISTRY_REPO = path.join(PROJECT_HOME, 'mcp', 'emulators.json');
 
 const RELAY_PORT = parseInt(process.env.BRIDGE_PORT || '8090', 10);
 const PREFERRED_AVD = process.env.EMU_AVD || null;
@@ -237,13 +237,43 @@ const persistPid = (name, pid) => { fs.writeFileSync(pidfileFor(name), String(pi
 
 const dropPid = (name) => { try { fs.unlinkSync(pidfileFor(name)); } catch {}; }
 
-// --- emulator registry (mcp/emulators.json) ---
+// --- emulator registry (state dir, migrated from mcp/emulators.json on first run) ---
+
+const EMULATOR_REGISTRY = path.join(dataDir(), 'emulators.json');
+
+// One-time migration: if the state-dir registry is absent but the repo file exists,
+// copy it so user-configured AVDs survive a repo update / re-clone.
+const migrateEmulatorRegistry = () => {
+  try {
+    if (fs.existsSync(EMULATOR_REGISTRY)) return;
+    if (fs.existsSync(EMULATOR_REGISTRY_REPO)) {
+      fs.copyFileSync(EMULATOR_REGISTRY_REPO, EMULATOR_REGISTRY);
+    }
+  } catch (e) {
+    // stderr is safe for a stdio MCP server; a silent failure here would look like lost AVDs
+    console.error(`[droidlab] registry migration failed: ${e.message}`);
+  }
+};
+migrateEmulatorRegistry();
 
 const readEmulatorRegistry = () => {
   try {
     const arr = JSON.parse(fs.readFileSync(EMULATOR_REGISTRY, 'utf8'));
     return Array.isArray(arr) ? arr : [];
   } catch { return []; }
+};
+
+const writeEmulatorRegistry = (cfg) => {
+  fs.writeFileSync(EMULATOR_REGISTRY, JSON.stringify(cfg, null, 2) + '\n');
+};
+
+// Serialize registry read-modify-write cycles (avd_create, ensureAvd run concurrently
+// with env_start's self-bootstrap; a bare read→push→write can drop entries).
+let registryChain = Promise.resolve();
+const withRegistryLock = (fn) => {
+  const run = registryChain.then(fn, fn);
+  registryChain = run.then(() => {}, () => {});
+  return run;
 };
 
 const lookupAvd = (name) => {
@@ -253,9 +283,11 @@ const lookupAvd = (name) => {
 
 const pickDefaultAvd = () => {
   if (PREFERRED_AVD) return lookupAvd(PREFERRED_AVD).avd;
+  const configured = loadConfig().defaultAvd;
+  if (configured) return lookupAvd(configured).avd;
   const cfg = readEmulatorRegistry();
   if (cfg.length && cfg[0].avd) return cfg[0].avd;
-  throw new Error('AVD not specified: pass avd, set EMU_AVD or add an entry to mcp/emulators.json');
+  throw new Error('AVD not specified: pass avd, set EMU_AVD or mcp_config defaultAvd, or add an entry to the emulator registry');
 };
 
 // --- MCP configuration (user-tunable defaults, persisted in the state dir) ---
@@ -269,6 +301,7 @@ const CONFIG_DEFAULTS = {
   extraArgs: '',
   bootTimeoutMs: 120000,
   scrcpyVersion: '4.1',
+  inputEnabled: false,
 };
 
 const loadConfig = () => {
@@ -287,6 +320,21 @@ const saveConfig = (partial) => {
 
 const isConfigDefaults = (cfg) => {
   return Object.entries(CONFIG_DEFAULTS).every(([k, v]) => cfg[k] === v);
+};
+
+// Config-vs-env precedence: an explicitly set config value wins; otherwise the env var,
+// otherwise the built-in default. (mcp_config documents "changes apply on next restart".)
+const effScrcpyVersion = () => {
+  const v = loadConfig().scrcpyVersion;
+  return v !== CONFIG_DEFAULTS.scrcpyVersion ? v : SCRCPY_VERSION;
+};
+const effExtraArgs = () => {
+  const v = loadConfig().extraArgs;
+  return v !== CONFIG_DEFAULTS.extraArgs ? v : EMU_APPEND_ARGS;
+};
+const effBootTimeout = () => {
+  const v = loadConfig().bootTimeoutMs;
+  return v !== CONFIG_DEFAULTS.bootTimeoutMs ? v : BOOT_DEADLINE_MS;
 };
 
 // The effective port: config file > env var > default.
@@ -539,8 +587,8 @@ const ensureScrcpy = async (extra) => {
   const asset = scrcpyAssetName();
   fs.mkdirSync(SCRCPY_HOME, { recursive: true });
   if (!scrcpy) {
-    const tgz = path.join(os.tmpdir(), `scrcpy-${asset}-v${SCRCPY_VERSION}.tar.gz`);
-    await httpsDownload(`https://github.com/Genymobile/scrcpy/releases/download/v${SCRCPY_VERSION}/scrcpy-${asset}-v${SCRCPY_VERSION}.tar.gz`, tgz, extra, `scrcpy v${SCRCPY_VERSION} (${asset})`);
+    const tgz = path.join(os.tmpdir(), `scrcpy-${asset}-v${effScrcpyVersion()}.tar.gz`);
+    await httpsDownload(`https://github.com/Genymobile/scrcpy/releases/download/v${effScrcpyVersion()}/scrcpy-${asset}-v${effScrcpyVersion()}.tar.gz`, tgz, extra, `scrcpy v${effScrcpyVersion()} (${asset})`);
     await execCmd('tar', ['-xzf', tgz, '-C', SCRCPY_HOME], { timeout: 120000 });
     fs.rmSync(tgz, { force: true });
   }
@@ -550,7 +598,7 @@ const ensureScrcpy = async (extra) => {
   let serverBin = server;
   if (!serverBin) {
     serverBin = path.join(dir, 'scrcpy-server');
-    await httpsDownload(`https://github.com/Genymobile/scrcpy/releases/download/v${SCRCPY_VERSION}/scrcpy-server-v${SCRCPY_VERSION}`, serverBin, extra, 'scrcpy-server');
+    await httpsDownload(`https://github.com/Genymobile/scrcpy/releases/download/v${effScrcpyVersion()}/scrcpy-server-v${effScrcpyVersion()}`, serverBin, extra, 'scrcpy-server');
   }
   try { fs.chmodSync(scrcpyBin, 0o755); } catch {}
   scrcpyPathsCache = { scrcpy: scrcpyBin, server: serverBin };
@@ -737,7 +785,7 @@ const renderStatus = (s) => {
   return lines.join('\n');
 };
 
-const mcp = new McpServer({ name: 'droidlab', version: '1.4.2' });
+const mcp = new McpServer({ name: 'droidlab', version: '1.5.1' });
 
 let startGate = false; // mutex: parallel env_start calls conflict over pidfiles and spawn
 
@@ -776,7 +824,7 @@ mcp.registerTool(
           '-avd', avdName,
           '-no-window', '-gpu', 'off', '-no-snapshot',
           '-memory', '2048', '-cores', '4',
-          ...EMU_APPEND_ARGS.split(/\s+/).filter(Boolean),
+          ...effExtraArgs().split(/\s+/).filter(Boolean),
         ];
         const bootLog = path.join(dataDir(), 'emulator.log');
         const emuEnv = { ANDROID_HOME: process.env.ANDROID_HOME || path.dirname(path.dirname(ADB_EXEC)) };
@@ -809,7 +857,7 @@ mcp.registerTool(
           await emitProgress(extra, Math.round((Date.now() - t0) / 1000), 60, 'emulator is appearing in adb');
           await pause(1500);
         }
-        await awaitBoot(BOOT_DEADLINE_MS, extra);
+        await awaitBoot(effBootTimeout(), extra);
         // remember how we launched it so the watchdog can restart it on a crash
         Object.assign(emuInfo, { avd: avdName, args, env: emuEnv, bootLog });
         autoRestartReset();
@@ -821,6 +869,11 @@ mcp.registerTool(
       catch (e) { scrcpyWarning = `scrcpy bootstrap failed (${e.message}) — h264 video may not stream`; }
 
       const bridge = await ensureRelayUp();
+      const cfg = loadConfig();
+      if (bridge.started && cfg.inputEnabled) {
+        await relayWrite({ type: 'input-mode', enabled: true, token: readRelayState().token });
+        await pause(150);
+      }
       const status = await collectStatus();
 
       const parts = [];
@@ -828,7 +881,7 @@ mcp.registerTool(
       if (emu.adopted) parts.push('External (non-MCP) emulator detected — it is being used; env_stop will not stop it.');
       if (emulatorStarted) parts.push(`Emulator ${avdName} started (cold boot${entry?.note ? `, note: ${entry.note}` : ''}); the device state is lost on env_stop.`);
       else parts.push(`Emulator ${avdName} was already running.`);
-      if (bridge.started) parts.push('Bridge started on loopback with a token: browser input is disabled until set_dev_input(true).');
+      if (bridge.started) parts.push(cfg.inputEnabled ? 'Bridge started on loopback: browser input ALLOWED (from config).' : 'Bridge started on loopback with a token: browser input is disabled until set_dev_input(true).');
       if (scrcpyWarning) parts.push(scrcpyWarning);
       // first-run: config.json does not exist yet — offer to customize defaults
       if (!fs.existsSync(CONFIG_PATH)) {
@@ -973,11 +1026,11 @@ mcp.registerTool(
   'env_list',
   {
     title: 'List emulators',
-    description: 'Entries of mcp/emulators.json + all AVDs discovered in the SDK (emulator -list-avds).',
+    description: 'Entries of the emulator registry + all AVDs discovered in the SDK (emulator -list-avds).',
     inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
-      configured: z.array(z.object({ name: z.string(), avd: z.string(), note: z.string().optional() })),
+      configured: z.array(z.object({ name: z.string(), avd: z.string(), note: z.string().optional(), device: z.string().optional() })),
       discovered: z.array(z.string()),
     },
   },
@@ -988,15 +1041,15 @@ mcp.registerTool(
       const discovered = stdout.split('\n').map((s) => s.trim()).filter(Boolean);
       const configured = new Set(cfg.map((e) => e.avd));
       const lines = [
-        'Config (mcp/emulators.json):',
-        ...(cfg.length ? cfg.map((e) => `- ${e.name} → AVD ${e.avd}${e.note ? ` (${e.note})` : ''}`) : ['- empty']),
-        'Discovered AVDs without a config entry:',
+        'Emulator registry:',
+        ...(cfg.length ? cfg.map((e) => `- ${e.name} → AVD ${e.avd}${e.note ? ` (${e.note})` : ''}${e.device ? ` [${e.device}]` : ''}`) : ['- empty']),
+        'Discovered AVDs without a registry entry:',
         ...(discovered.filter((a) => !configured.has(a)).map((a) => `- ${a}`) || ['- none']),
       ];
       return {
         content: [{ type: 'text', text: lines.join('\n') }],
         structuredContent: {
-          configured: cfg.map((e) => ({ name: e.name, avd: e.avd, ...(e.note ? { note: e.note } : {}) })),
+          configured: cfg.map((e) => ({ name: e.name, avd: e.avd, ...(e.note ? { note: e.note } : {}), ...(e.device ? { device: e.device } : {}) })),
           discovered,
         },
       };
@@ -1187,18 +1240,26 @@ const ensureAvd = async (avdName, entry, extra) => {
     if (!presentImages().includes(pkg)) throw new Error(`image ${pkg} was not found after install (check sdkmanager output)`);
     log.push(`image installed: ${pkg} (pixel_7 device profile on AVD creation)`);
   }
+  const device = entry?.device || 'pixel_7';
   const avdRoot = path.join(os.homedir(), '.android', 'avd');
   fs.mkdirSync(avdRoot, { recursive: true });
-  await execCmd(avdmanagerPath(), ['create', 'avd', '-n', avdName, '-k', pkg, '-d', 'pixel_7', '--force'],
+  await execCmd(avdmanagerPath(), ['create', 'avd', '-n', avdName, '-k', pkg, '-d', device, '--force'],
     { timeout: 60000, env: { ANDROID_AVD_HOME: avdRoot, ANDROID_SDK_HOME: os.homedir() } });
   if (!(await listAvds()).includes(avdName)) throw new Error(`AVD ${avdName} did not appear after avdmanager`);
-  log.push(`AVD created: ${avdName}`);
-  const cfg = readEmulatorRegistry();
-  if (!cfg.some((e) => e.avd === avdName)) {
-    cfg.push({ name: entry?.name || `android-${api}`, avd: avdName, note: `google_apis/${abi}` });
-    fs.writeFileSync(EMULATOR_REGISTRY, JSON.stringify(cfg, null, 2) + '\n');
-    log.push(`registered in mcp/emulators.json`);
-  }
+  log.push(`AVD created: ${avdName} (${device})`);
+  await withRegistryLock(() => {
+    const cfg = readEmulatorRegistry();
+    const existing = cfg.find((e) => e.avd === avdName);
+    if (existing) {
+      // --force recreate: refresh note/device so the registry does not go stale
+      existing.note = `google_apis/${abi}`;
+      existing.device = device;
+    } else {
+      cfg.push({ name: entry?.name || `android-${api}`, avd: avdName, note: `google_apis/${abi}`, device });
+    }
+    writeEmulatorRegistry(cfg);
+  });
+  log.push('registered in emulator registry');
   return log;
 };
 
@@ -1262,18 +1323,20 @@ mcp.registerTool(
   'avd_create',
   {
     title: 'Create AVD from system image',
-    description: 'Create an AVD (pixel_7 profile) from a system image + add entry to emulators.json. Tag/ABI from the package.',
+    description: 'Create an AVD from a system image + add entry to the emulator registry. Tag/ABI from the package. Device profile defaults to pixel_7; use list_devices to see options (pixel_tablet, nexus_7, …).',
     inputSchema: {
       name: z.string().regex(/^[\w-]+$/, 'AVD name (letters, digits, _ and -)').describe('Name of the new AVD, e.g. API34'),
       package: z.string().regex(IMAGE_PKG_RE, 'system-images;android-N;tag;abi').describe('An installed image from system_images_list'),
-      alias: z.string().optional().describe('Human-readable name for emulators.json (default name)'),
+      device: z.string().optional().describe('Device profile (default pixel_7). See list_devices for options: pixel_tablet, nexus_7, generic_tablet_768dpi, …'),
+      alias: z.string().optional().describe('Human-readable name for the registry (default name)'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
-  async ({ name, package: pkg, alias }) => {
+  async ({ name, package: pkg, device, alias }) => {
     try {
       const m = pkg.match(IMAGE_PKG_RE);
       const [, , tag, abi] = m;
+      const dev = device || 'pixel_7';
       if (!presentImages().includes(pkg)) {
         throw new Error(`image not installed: ${pkg} — run system_image_install first`);
       }
@@ -1283,7 +1346,7 @@ mcp.registerTool(
         'create', 'avd',
         '-n', name,
         '-k', pkg,
-        '-d', 'pixel_7',
+        '-d', dev,
         '--force',
       ], { timeout: 60000, env: { ANDROID_AVD_HOME: avdRoot, ANDROID_SDK_HOME: os.homedir() } });
       // avdmanager writes "Loading..." to stderr — we ignore it and check the result
@@ -1291,19 +1354,64 @@ mcp.registerTool(
       if (!listOut.stdout.split('\n').map((s) => s.trim()).includes(name)) {
         throw new Error(`AVD ${name} did not appear after avdmanager: ${(stdout || '').trim().split('\n').slice(-3).join(' | ')}`);
       }
-      // saving the entry to emulators.json
-      const cfg = readEmulatorRegistry();
-      const entryName = alias || `android-${name.replace(/^API/i, '')}`;
-      if (!cfg.some((e) => e.avd === name)) {
-        cfg.push({ name: entryName, avd: name, note: `${tag}/${abi}` });
-        fs.writeFileSync(EMULATOR_REGISTRY, JSON.stringify(cfg, null, 2) + '\n');
-      }
+      // saving the entry to the emulator registry
+      const entryName = await withRegistryLock(() => {
+        const cfg = readEmulatorRegistry();
+        const existing = cfg.find((e) => e.avd === name);
+        if (existing) {
+          // --force recreate: refresh note/device so the registry does not go stale
+          existing.note = `${tag}/${abi}`;
+          existing.device = dev;
+          writeEmulatorRegistry(cfg);
+          return existing.name;
+        }
+        const newName = alias || `android-${name.replace(/^API/i, '')}`;
+        cfg.push({ name: newName, avd: name, note: `${tag}/${abi}`, device: dev });
+        writeEmulatorRegistry(cfg);
+        return newName;
+      });
       return replyText([
-        `AVD created: ${name} (${pkg}, pixel_7)`,
-        `Entry in emulators.json: "${entryName}" → AVD ${name}`,
+        `AVD created: ${name} (${pkg}, ${dev})`,
+        `Registry entry: "${entryName}" → AVD ${name}`,
         'Start: env_start({avd: "' + entryName + '"}) — before starting another AVD, run env_stop first.',
       ].join('\n'));
     } catch (e) { return replyError(e); }
+  },
+);
+
+mcp.registerTool(
+  'list_devices',
+  {
+    title: 'List available device profiles',
+    description: 'Device profiles usable with avd_create (pixel_7, pixel_tablet, nexus_7, …). Run avdmanager list device.',
+    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    outputSchema: { devices: z.array(z.object({ id: z.string(), name: z.string() })) },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  async () => {
+    try {
+      const { stdout } = await execCmd(avdmanagerPath(), ['list', 'device'], { timeout: 30000 });
+      // avdmanager output: 'id: 31 or "pixel_7"' / '    Name: Pixel 7' / '    OEM : Google' / '---------'
+      const entries = [];
+      let cur = null;
+      for (const line of stdout.split('\n')) {
+        const idm = line.match(/^id:\s*\d+\s+or\s+"([^"]+)"/);
+        if (idm) { cur = { id: idm[1], name: '' }; entries.push(cur); continue; }
+        const nm = line.match(/^\s+Name:\s*(.+)/);
+        if (nm && cur) { cur.name = nm[1].trim(); }
+      }
+      const lines = entries.map((e) => `- ${e.id} — ${e.name}`);
+      return {
+        content: [{ type: 'text', text: `Available device profiles (${entries.length}):\n${lines.join('\n')}` }],
+        structuredContent: { devices: entries },
+      };
+    } catch (e) {
+      // fresh host without cmdline-tools: env_start self-bootstraps them
+      if (e.code === 'ENOENT') {
+        return replyError(new Error('avdmanager not found (cmdline-tools not installed) — run env_start once: it downloads cmdline-tools automatically, then retry list_devices'));
+      }
+      return replyError(e);
+    }
   },
 );
 
@@ -1964,15 +2072,14 @@ mcp.registerTool(
     try {
       assertNotAborted(extra, 'bridge_restart');
       const prev = readRelayState();
-      let inputWasOn = false;
-      try { inputWasOn = !!(await relayJson('/state')).inputEnabled; } catch {}
+      const cfg = loadConfig();
       await cycleRelay(prev?.host || '127.0.0.1');
       const state = await relayJson('/state');
       let inputNote = 'browser input: disabled (default) — allow it: set_dev_input(true)';
-      if (inputWasOn) {
+      if (cfg.inputEnabled) {
         await relayWrite({ type: 'input-mode', enabled: true, token: readRelayState().token });
         await pause(150);
-        inputNote = 'browser input: restored to ALLOWED';
+        inputNote = 'browser input: restored to ALLOWED (from config)';
       }
       const accessToken = readRelayState()?.accessToken;
       const urls = [];
@@ -2054,16 +2161,16 @@ mcp.registerTool(
       const t0 = Date.now();
       let seenOffline = false;
       let lastSent = -1;
-      while (Date.now() - t0 < BOOT_DEADLINE_MS) {
+      while (Date.now() - t0 < effBootTimeout()) {
         assertNotAborted(extra, 'rebooting the emulator');
         const sec = Math.round((Date.now() - t0) / 1000);
-        if (sec - lastSent >= 5) { lastSent = sec; await emitProgress(extra, sec, Math.round(BOOT_DEADLINE_MS / 1000), 'rebooting Android'); }
+        if (sec - lastSent >= 5) { lastSent = sec; await emitProgress(extra, sec, Math.round(effBootTimeout() / 1000), 'rebooting Android'); }
         const s = await primaryEmuSerial();
         if (!s) { seenOffline = true; }
         else if (seenOffline && (await deviceBooted())) break;
         await pause(2000);
       }
-      if (!(await deviceBooted())) throw new Error(`emulator did not boot within ${BOOT_DEADLINE_MS / 1000}s`);
+      if (!(await deviceBooted())) throw new Error(`emulator did not boot within ${effBootTimeout() / 1000}s`);
       const ver = (await adbShell('getprop ro.build.version.release', 8000)).trim();
       const fg = await frontmostApp();
       return replyText(`Reboot completed: Android ${ver}${fg ? `, foreground: ${fg}` : ''}`);
@@ -2122,9 +2229,10 @@ mcp.registerTool(
     try {
       assertRelayOwned();
       await relayWrite({ type: 'input-mode', enabled, token: readRelayState().token });
+      saveConfig({ inputEnabled: enabled });
       await pause(150);
       const st = await relayJson('/state');
-      return replyText(`Browser input: ${st.inputEnabled ? 'ALLOWED' : 'disallowed (observation)'}`);
+      return replyText(`Browser input: ${st.inputEnabled ? 'ALLOWED' : 'disallowed (observation)'} (persisted)`);
     } catch (e) { return replyError(e); }
   },
 );
@@ -2319,7 +2427,7 @@ mcp.registerTool(
   'mcp_config',
   {
     title: 'Get/set MCP configuration',
-    description: 'Read/update persisted config (state dir/config.json). Options: port, requireToken, defaultAvd, extraArgs, bootTimeoutMs, scrcpyVersion. {show:true} reads; pass keys to update; {reset:true} restores defaults; {defaults:true} confirms defaults. Changes apply on next bridge restart.',
+    description: 'Read/update persisted config (state dir/config.json). Options: port, requireToken, defaultAvd, extraArgs, bootTimeoutMs, scrcpyVersion, inputEnabled. {show:true} reads; pass keys to update; {reset:true} restores defaults; {defaults:true} confirms defaults. Changes apply on next bridge restart.',
     inputSchema: {
       show: z.boolean().optional().describe('true — return the current configuration'),
       reset: z.boolean().optional().describe('true — restore built-in defaults and delete config.json'),
@@ -2330,6 +2438,7 @@ mcp.registerTool(
       extraArgs: z.string().optional().describe('Extra emulator arguments (default "")'),
       bootTimeoutMs: z.number().int().min(5000).max(600000).optional().describe('Boot wait limit in ms (default 120000)'),
       scrcpyVersion: z.string().optional().describe('scrcpy release to download (default "4.1")'),
+      inputEnabled: z.boolean().optional().describe('Browser input enabled by default after bridge start (default false)'),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
@@ -2340,6 +2449,7 @@ mcp.registerTool(
         extraArgs: z.string(),
         bootTimeoutMs: z.number(),
         scrcpyVersion: z.string(),
+        inputEnabled: z.boolean(),
       }),
       file: z.string(),
       note: z.string().optional(),

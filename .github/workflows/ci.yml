@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check
+        run: |
+          node --check mcp/server.mcp.mjs
+          node --check web/server.js
+          node --check scripts/e2e-mcp.mjs
+          node --check scripts/check-tools.mjs
+
+      - name: MCP smoke test (tools/list, annotations, no emulator needed)
+        run: node scripts/check-tools.mjs
+
+      # Full live cycle on a real emulator (heavy, needs Android SDK + KVM):
+      # npm run e2e:mcp — see README ("End-to-end test").

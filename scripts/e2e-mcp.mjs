@@ -81,7 +81,7 @@ async function main() {
 
   const tools = await client.listTools();
   const expected = ['env_start', 'env_stop', 'env_status', 'env_list', 'reboot_emulator', 'adb_restart',
-    'system_images_list', 'system_image_install', 'avd_create',
+    'system_images_list', 'system_image_install', 'avd_create', 'list_devices',
     'screenshot', 'tap', 'swipe', 'scroll', 'key', 'text', 'clipboard_get', 'clipboard_set',
     'install_apk', 'push_file', 'pull_file', 'open_app', 'close_app', 'app_list', 'ui_dump',
     'wait_for', 'deep_link', 'app_permission',
@@ -89,7 +89,13 @@ async function main() {
     'shell', 'emu', 'bugreport', 'app_uninstall', 'app_clear_data', 'bridge_logs', 'pinch', 'set_orientation', 'bridge_restart',
     'mcp_config'];
   const missing = expected.filter((t) => !tools.tools.some((x) => x.name === t));
-  check('mcp: tools/list (43 tools)', missing.length === 0, missing.length ? `missing: ${missing.join(',')}` : 'all present');
+  check(`mcp: tools/list (${expected.length} tools)`, missing.length === 0, missing.length ? `missing: ${missing.join(',')}` : 'all present');
+
+  // --- list_devices smoke test (read-only, needs avdmanager only) ---
+  const ld = await client.callTool({ name: 'list_devices', arguments: { confirm: true } });
+  const ldDevs = ld.structuredContent?.devices || [];
+  check('list_devices: profiles found', !ld.isError && ldDevs.length > 0 && ldDevs.every((x) => x.id && x.name),
+    `${ldDevs.length} profiles, e.g. ${ldDevs.find((x) => x.id === 'pixel_7')?.name || 'pixel_7 missing'}`);
 
   // --- annotations (MCP standard: hints for client UIs) ---
   const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -305,6 +311,18 @@ async function main() {
   const cfgReset = await client.callTool({ name: 'mcp_config', arguments: { reset: true } });
   const cfgResetText = (cfgReset.content || []).map((c) => c.text || '').join('\n');
   check('mcp_config: reset to defaults (port=8090)', !cfgReset.isError && /"port": 8090/.test(cfgResetText), cfgResetText.split('\n')[0]?.slice(0, 60) || '');
+
+  const cfgInput = await client.callTool({ name: 'mcp_config', arguments: { inputEnabled: true } });
+  const cfgInputText = (cfgInput.content || []).map((c) => c.text || '').join('\n');
+  check('mcp_config: set inputEnabled=true', !cfgInput.isError && /"inputEnabled": true/.test(cfgInputText), cfgInputText.split('\n')[0]?.slice(0, 60) || '');
+
+  const cfgInputVerify = await client.callTool({ name: 'mcp_config', arguments: { show: true } });
+  const cfgInputVerifyText = (cfgInputVerify.content || []).map((c) => c.text || '').join('\n');
+  check('mcp_config: inputEnabled=true persisted', /"inputEnabled": true/.test(cfgInputVerifyText));
+
+  const cfgReset2 = await client.callTool({ name: 'mcp_config', arguments: { reset: true } });
+  const cfgReset2Text = (cfgReset2.content || []).map((c) => c.text || '').join('\n');
+  check('mcp_config: reset clears inputEnabled', /"inputEnabled": false/.test(cfgReset2Text));
 
   // --- auto-restore: video stream survives an emulator crash (ensureDeviceWatch) ---
   // Only when we own the lifecycle (we booted it ourselves), so we don't kill a pre-running emulator.

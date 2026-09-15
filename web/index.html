@@ -341,7 +341,7 @@ function loadResolutions() {
   }).catch(() => {});
 }
 
-const SCREEN_W = 1080, SCREEN_H = 2400;
+let SCREEN_W = 1080, SCREEN_H = 2400;
 function toScreen(cx, cy) {
   const r = c.getBoundingClientRect();
   let x = Math.round((cx - r.left) / r.width * SCREEN_W);
@@ -353,6 +353,12 @@ function toScreen(cx, cy) {
     y
   };
 }
+fetch(withAuth('/state')).then(r => r.json()).then(d => {
+  if (d.screenWidth && d.screenHeight) {
+    SCREEN_W = d.screenWidth;
+    SCREEN_H = d.screenHeight;
+  }
+}).catch(() => {});
 
 function send(obj) {
   if (!devInput) return;

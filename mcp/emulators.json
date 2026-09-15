@@ -1,11 +1,87 @@
 [
   {
-    "name": "android-13",
-    "avd": "API33"
+    "name": "android-4.0",
+    "avd": "API14",
+    "note": "google_apis/x86"
   },
   {
-    "name": "android-15",
-    "avd": "API35",
+    "name": "android-4.1",
+    "avd": "API16",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-4.2",
+    "avd": "API17",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-4.3",
+    "avd": "API18",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-4.4",
+    "avd": "API19",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-5.0",
+    "avd": "API21",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-5.1",
+    "avd": "API22",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-6.0",
+    "avd": "API23",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-7.0",
+    "avd": "API24",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-7.1",
+    "avd": "API25",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-8.0",
+    "avd": "API26",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-8.1",
+    "avd": "API27",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-9.0",
+    "avd": "API28",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-10",
+    "avd": "API29",
+    "note": "google_apis/x86"
+  },
+  {
+    "name": "android-11",
+    "avd": "API30",
+    "note": "google_apis/x86_64"
+  },
+  {
+    "name": "android-12",
+    "avd": "API31",
+    "note": "google_apis/x86_64"
+  },
+  {
+    "name": "android-13",
+    "avd": "API33",
     "note": "google_apis/x86_64"
   },
   {
@@ -14,8 +90,18 @@
     "note": "google_apis/x86_64"
   },
   {
-    "name": "android-11",
-    "avd": "API30",
+    "name": "android-15",
+    "avd": "API35",
+    "note": "google_apis/x86_64"
+  },
+  {
+    "name": "android-16",
+    "avd": "API36",
+    "note": "google_apis/x86_64"
+  },
+  {
+    "name": "android-17",
+    "avd": "API37",
     "note": "google_apis/x86_64"
   }
 ]

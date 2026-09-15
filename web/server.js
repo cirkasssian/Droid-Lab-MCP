@@ -73,6 +73,7 @@ function encSizeMax(cfg) {
 }
 
 let cachedVersion = null;
+let cachedScreenSize = null; // { w, h } from `wm size`
 let clients = new Set();
 let curRes = DEFAULT_RES;
 
@@ -110,6 +111,14 @@ function adb(args) {
       err ? reject(err) : resolve(stdout);
     });
   });
+}
+
+// constant-time token comparison (token values are secrets; plain === leaks timing)
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || !a.length || !b.length) return false;
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
 }
 
 // --- H.264: parsing the screenrecord Annex-B stream into access units (frames) ---
@@ -786,6 +795,15 @@ setInterval(() => {
 async function handleInputMsg(ws, d) {
   try {
     if (!(ws && ws.isController) && !devInputEnabled) return; // observation mode: input is dropped
+    // WS JSON is untrusted (a leaked token = arbitrary WS messages): every value that
+    // reaches the `adb shell` fallback below must be a finite number or a string we escape.
+    const num = (v) => typeof v === 'number' && Number.isFinite(v);
+    if (d.type === 'tap' && !(num(d.x) && num(d.y))) return;
+    if (d.type === 'swipe' && !(num(d.x1) && num(d.y1) && num(d.x2) && num(d.y2))) return;
+    if (d.type === 'key' && !num(d.code)) return;
+    if (d.type === 'scroll' && !(num(d.x) && num(d.y))) return;
+    if (d.type === 'pinch' && !(num(d.x) && num(d.y))) return;
+    if ((d.type === 'text' || d.type === 'clip-set') && typeof d.text !== 'string') return;
     // scrcpy control channel: per-input injection with no process (~5ms vs ~50-300ms for adb)
     if (ctrlReady()) {
       switch (d.type) {
@@ -860,7 +878,7 @@ function authorized(req, url) {
   const q = url.searchParams.get('token');
   const h = req.headers['x-access-token'] ||
     (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  return q === WEB_ACCESS_TOKEN || h === WEB_ACCESS_TOKEN;
+  return safeEqual(q, WEB_ACCESS_TOKEN) || safeEqual(h, WEB_ACCESS_TOKEN);
 }
 
 // --- TLS: self-signed cert so the page is a secure context (WebCodecs needs HTTPS) ---
@@ -926,6 +944,12 @@ try {
     return;
   }
   if (pathname === '/push' && req.method === 'POST') {
+    // install/push is a privileged action: when WEB_CONTROL_TOKEN is set (MCP-managed mode)
+    // an access-token observer must not be able to install APKs — installs go through MCP.
+    if (WEB_CONTROL_TOKEN && !safeEqual(url.searchParams.get('ctoken'), WEB_CONTROL_TOKEN)) {
+      json(res, 403, { error: 'install/push requires ctoken=<WEB_CONTROL_TOKEN> (or use the MCP install_apk/push_file tools)' });
+      return;
+    }
     const name = (url.searchParams.get('name') || 'file.bin').replace(/[^A-Za-z0-9._-]/g, '_');
     const chunks = [];
     let size = 0;
@@ -947,6 +971,13 @@ try {
     return;
   }
   if (pathname === '/state') {
+    if (!cachedScreenSize) {
+      try {
+        const out = (await adb('wm size')).trim();
+        const m = out.match(/(\d+)x(\d+)/);
+        if (m) cachedScreenSize = { w: parseInt(m[1], 10), h: parseInt(m[2], 10) };
+      } catch {}
+    }
     json(res, 200, {
       inputEnabled: devInputEnabled,
       controlled: !!WEB_CONTROL_TOKEN,
@@ -955,6 +986,8 @@ try {
       resolution: curRes,
       version: cachedVersion ? cachedVersion.trim() : null,
       crash: crashInfo,
+      screenWidth: cachedScreenSize?.w || null,
+      screenHeight: cachedScreenSize?.h || null,
     });
     return;
   }
@@ -1017,7 +1050,7 @@ wss.on('connection', (ws) => {
     let d;
     try { d = JSON.parse(data.toString()); } catch { return; }
     if (d.type === 'init') {
-      ws.isController = !!(WEB_CONTROL_TOKEN && d.token && d.token === WEB_CONTROL_TOKEN);
+      ws.isController = !!(WEB_CONTROL_TOKEN && safeEqual(d.token, WEB_CONTROL_TOKEN));
       ws.codec = d.codec === 'h264' ? 'h264' : 'none';
       console.log(`[bridge] client codec: ${ws.codec}${ws.isController ? ' (controller)' : ''}`);
       ws.send(JSON.stringify({ type: 'input-mode', enabled: devInputEnabled }));
@@ -1043,13 +1076,17 @@ wss.on('connection', (ws) => {
       return;
     }
     if (d.type === 'input-mode') {
-      if (!ws.isController || !WEB_CONTROL_TOKEN || d.token !== WEB_CONTROL_TOKEN) return;
+      if (!ws.isController || !WEB_CONTROL_TOKEN || !safeEqual(d.token, WEB_CONTROL_TOKEN)) return;
       devInputEnabled = !!d.enabled;
       console.log('[bridge] dev input:', devInputEnabled ? 'enabled' : 'disabled');
       const note = JSON.stringify({ type: 'input-mode', enabled: devInputEnabled });
       for (const cl of clients) if (cl.readyState === 1) cl.send(note);
       return;
     }
+    // input rate limit: 200 msg/s per connection (a swipe is 1 msg; real input never approaches this)
+    const now = Date.now();
+    if (!ws.rl || now - ws.rl.ts >= 1000) ws.rl = { ts: now, n: 0 };
+    if (++ws.rl.n > 200) { console.error('[ws] input rate limit exceeded, message dropped'); return; }
     handleInputMsg(ws, d);
   });
   ws.on('close', () => {
