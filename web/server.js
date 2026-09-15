@@ -1029,7 +1029,7 @@ wss.on('connection', (ws) => {
           if (fresh) {
             ws.send(lastKeyAU.msg);
           }
-          if (!videoHost.running()) startVideoHost();
+          if (!videoHost.running() || !fresh) startVideoHost();
           setTimeout(() => { if (clients.size > 0 && !ctrlHost.running()) startCtrlHost(); }, 600);
         } else {
           const fresh = lastKeyAU && Date.now() - lastKeyAU.ts < 1500;
