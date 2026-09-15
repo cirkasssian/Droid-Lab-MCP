@@ -6,6 +6,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import fs from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -31,7 +32,7 @@ function httpState(withToken = true) {
   return new Promise((resolve, reject) => {
     const info = withToken ? bridgeInfo() : null;
     const q = info?.accessToken ? `?token=${encodeURIComponent(info.accessToken)}` : '';
-    const req = http.get({ host: '127.0.0.1', port: PORT, path: `/state${q}`, timeout: 4000 }, (res) => {
+    const req = https.get({ host: '127.0.0.1', port: PORT, path: `/state${q}`, timeout: 4000, rejectUnauthorized: false }, (res) => {
       let d = '';
       res.on('data', (c) => { d += c; });
       res.on('end', () => resolve({ code: res.statusCode, body: d ? JSON.parse(d) : null }));
@@ -84,9 +85,10 @@ async function main() {
     'screenshot', 'tap', 'swipe', 'scroll', 'key', 'text', 'clipboard_get', 'clipboard_set',
     'install_apk', 'push_file', 'pull_file', 'open_app', 'close_app', 'app_list', 'ui_dump',
     'wait_for', 'deep_link', 'app_permission',
-    'logcat', 'device_state', 'access_start', 'access_stop', 'set_dev_input', 'set_resolution'];
+    'logcat', 'device_state', 'access_start', 'access_stop', 'set_dev_input', 'set_resolution',
+    'shell', 'emu', 'bugreport', 'app_uninstall', 'app_clear_data', 'bridge_logs', 'pinch', 'set_orientation', 'bridge_restart'];
   const missing = expected.filter((t) => !tools.tools.some((x) => x.name === t));
-  check('mcp: tools/list (33 tools)', missing.length === 0, missing.length ? `missing: ${missing.join(',')}` : 'all present');
+  check('mcp: tools/list (42 tools)', missing.length === 0, missing.length ? `missing: ${missing.join(',')}` : 'all present');
 
   // --- annotations (MCP standard: hints for client UIs) ---
   const byName = Object.fromEntries(tools.tools.map((t) => [t.name, t]));
@@ -211,11 +213,28 @@ async function main() {
   const resList = await client.callTool({ name: 'set_resolution', arguments: { list: true } });
   check('set_resolution: list mode', !resList.isError && /486x1080/.test(resList.content?.[0]?.text || ''));
 
+  // --- shell / emu / bridge_logs / pinch / set_orientation ---
+  const sh = await client.callTool({ name: 'shell', arguments: { cmd: 'echo e2e-shell-ok' } });
+  check('shell: echo roundtrip', !sh.isError && /e2e-shell-ok/.test(sh.content?.[0]?.text || ''), (sh.content?.[0]?.text || '').slice(0, 60));
+  const shErr = await client.callTool({ name: 'shell', arguments: { cmd: 'false' } });
+  check('shell: non-zero exit reported', !shErr.isError && /exit=[^0]/.test(shErr.content?.[0]?.text || ''), (shErr.content?.[0]?.text || '').slice(0, 40));
+  const emuName = await client.callTool({ name: 'emu', arguments: { cmd: 'avd name' } });
+  check('emu: avd name', !emuName.isError && /OK/.test(emuName.content?.[0]?.text || ''), (emuName.content?.[0]?.text || '').slice(0, 60));
+  const bl = await client.callTool({ name: 'bridge_logs', arguments: { file: 'bridge', lines: 20 } });
+  check('bridge_logs: tail returned', !bl.isError && /\(.+\d+ lines total/.test(bl.content?.[0]?.text || ''), (bl.content?.[0]?.text || '').split('\n')[0]?.slice(0, 80));
+  const ori = await client.callTool({ name: 'set_orientation', arguments: { orientation: 'landscape' } });
+  check('set_orientation: lock landscape', !ori.isError && /user_rotation=1/.test(ori.content?.[0]?.text || ''), (ori.content?.[0]?.text || '').slice(0, 60));
+  const oriBack = await client.callTool({ name: 'set_orientation', arguments: { orientation: 'portrait' } });
+  check('set_orientation: back to portrait', !oriBack.isError && /user_rotation=0/.test(oriBack.content?.[0]?.text || ''), '');
+  const pinch = await client.callTool({ name: 'pinch', arguments: { x: 540, y: 1200, dist: 600, ms: 400 } });
+  check('pinch: accepted by bridge', !pinch.isError, (pinch.content?.[0]?.text || '').slice(0, 60));
+
+
   // --- access + input-mode ---
   const acc = await client.callTool({ name: 'access_start', arguments: {} });
   const accText = acc.content?.[0]?.text || '';
   const s1 = await httpState();
-  check('access_start: bridge on 0.0.0.0 + URL', !acc.isError && s1.body?.host === '0.0.0.0' && /http:\/\/\d+\./.test(accText), `host=${s1.body?.host}`);
+  check('access_start: bridge on 0.0.0.0 + URL', !acc.isError && s1.body?.host === '0.0.0.0' && /https:\/\/\d+\./.test(accText), `host=${s1.body?.host}`);
 
   // access is token-protected: without a token it is 401; the URL from access_start contains ?token=
   const noAuth = await httpState(false);
@@ -233,7 +252,7 @@ async function main() {
   const rogue = await new Promise((resolve) => {
     const info = bridgeInfo();
     const wsQuery = info?.accessToken ? `?token=${encodeURIComponent(info.accessToken)}` : '';
-    const sock = new WebSocket(`ws://127.0.0.1:${PORT}/${wsQuery}`);
+    const sock = new WebSocket(`wss://127.0.0.1:${PORT}/${wsQuery}`, { rejectUnauthorized: false });
     sock.on('open', () => sock.send(JSON.stringify({ type: 'init', codec: 'none', token: 'WRONG' })));
     sock.on('message', (d) => { const m = JSON.parse(d.toString()); if (m.type === 'input-mode') resolve(m.enabled); });
     sock.on('error', () => resolve('ws-error'));
@@ -248,6 +267,13 @@ async function main() {
   await client.callTool({ name: 'access_stop', arguments: {} });
   const s5 = await httpState();
   check('access_stop: back to loopback', s5.body?.host === '127.0.0.1', `host=${s5.body?.host}`);
+
+  // --- bridge_restart (preserves host binding, regenerates token, new pid) ---
+  const pidBefore = bridgeInfo()?.pid;
+  const br = await client.callTool({ name: 'bridge_restart', arguments: {} });
+  const pidAfter = bridgeInfo()?.pid;
+  const s6 = await httpState();
+  check('bridge_restart: bridge up on new pid', !br.isError && !!pidBefore && !!pidAfter && pidBefore !== pidAfter && s6.body?.host === '127.0.0.1', `pid ${pidBefore} → ${pidAfter}, host=${s6.body?.host}`);
 
   // --- resources ---
   try {

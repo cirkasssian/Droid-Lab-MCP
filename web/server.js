@@ -1,6 +1,8 @@
-const { exec, spawn } = require('child_process');
+const { exec, spawn, execSync } = require('child_process');
 const http = require('http');
+const https = require('https');
 const net = require('net');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -36,10 +38,7 @@ function scrcpyHomeBin(name) {
 }
 
 const ADB = process.env.ADB || sdkBin('platform-tools/adb');
-const FFMPEG = process.env.FFMPEG || 'ffmpeg';
-const SCRCPY = process.env.SCRCPY || scrcpyHomeBin(process.platform === 'win32' ? 'scrcpy.exe' : 'scrcpy');
 const SCRCPY_SERVER = process.env.SCRCPY_SERVER || scrcpyHomeBin('scrcpy-server');
-const X_DISPLAY = process.env.X_DISPLAY || ':99';
 
 // --- input mode (observe/interactive) ---
 // WEB_CONTROL_TOKEN — bridge under MCP-agent control: browser input is disabled
@@ -52,13 +51,12 @@ let devInputEnabled = WEB_CONTROL_TOKEN ? false : process.env.WEB_INPUT_ENABLED 
 // X-Access-Token header or Authorization: Bearer). Set by MCP on every bridge
 // start; manual run without the variable works as before (no authentication).
 const WEB_ACCESS_TOKEN = process.env.WEB_ACCESS_TOKEN || null;
-const WEBP_QUALITY = 50;
-// primary h264 source: 'scrcpy' (no 180s limit, length-prefixed framing) or 'screenrecord' (fallback)
+// h264 source: 'scrcpy' (default, no 180s limit) or 'screenrecord' (fallback)
 const VIDEO_SRC = process.env.VIDEO_SRC === 'screenrecord' ? 'screenrecord' : 'scrcpy';
 
-// fps — measured limit of x11grab+libwebp (compression_level 1); srSize — encode size of h264
-// and the webp-path window (see encSizeMax), null = native 1080x2400. The full tier is also encoded
-// at 486x1080: a software-rendered emulator's encoder is real-time only up to that size, native accumulates a queue -> seconds of delay.
+// fps — encoder cap; srSize — h264 encode size (see encSizeMax), null = native 1080x2400.
+// The full tier is also encoded at 486x1080: a software-rendered emulator's encoder is
+// real-time only up to that size, native accumulates a queue -> seconds of delay.
 // max — fallback size when srSize=null (0 = native).
 const RESOLUTIONS = {
   '324x720':   { max: 720,  bitrate: '3M', fps: 30, srSize: '324x720' },
@@ -67,21 +65,16 @@ const RESOLUTIONS = {
 };
 const DEFAULT_RES = '486x1080';
 
-// upper size bound for the h264 encode (scrcpy max_size, screenrecord --size) and the
-// desktop-scrcpy window (webp): a software-rendered emulator's encoder is real-time only up to 486x1080, a larger size
-// (including native 1080x2400) accumulates a queue -> delay grows to seconds on any path
+// upper size bound for the h264 encode (scrcpy max_size, screenrecord --size):
+// a software-rendered emulator's encoder is real-time only up to 486x1080, a larger size
+// (including native 1080x2400) accumulates a queue -> delay grows to seconds
 function encSizeMax(cfg) {
   return cfg.srSize ? parseInt(cfg.srSize.split('x')[1], 10) : (cfg.max || 0);
 }
 
 let cachedVersion = null;
-let ffmpegProc = null;
-let scrcpyProc = null;
-let streaming = false;
 let clients = new Set();
-let curW = 0, curH = 0, curX = 0, curY = 0;
 let curRes = DEFAULT_RES;
-let curScrcpyPgrp = 0;
 
 // --- H.264 pipeline: screenrecord -> WS -> browser WebCodecs ---
 let srProc = null;
@@ -100,11 +93,6 @@ function clientsByCodec(codec) {
   return out;
 }
 
-function broadcastWebp(data) {
-  const copy = Buffer.from(data);
-  for (const ws of clientsByCodec('webp')) ws.send(copy);
-}
-
 function broadcastH264(msg) {
   for (const ws of clientsByCodec('h264')) ws.send(msg);
 }
@@ -115,158 +103,6 @@ function adb(args) {
       err ? reject(err) : resolve(stdout);
     });
   });
-}
-
-function execCmd(cmd, args) {
-  return new Promise((resolve) => {
-    exec(cmd + ' ' + args.join(' '), { env: { ...process.env, DISPLAY: X_DISPLAY }, timeout: 5000 }, (err, stdout) => {
-      resolve(stdout ? stdout.trim() : '');
-    });
-  });
-}
-
-async function detectScrcpyWindow() {
-  if (!curScrcpyPgrp) return null;
-  const pid = curScrcpyPgrp;
-  const out = await execCmd('xwininfo', ['-root', '-tree', '-display', X_DISPLAY]);
-  for (const line of out.split('\n')) {
-    if (!line.includes('"scrcpy"') && !line.includes('gphone')) continue;
-    const m = line.match(/(\d+)x(\d+)\+(\d+)\+(\d+)/);
-    if (!m) continue;
-    const wid = line.trim().split(/\s+/)[0];
-    const prop = await execCmd('xprop', ['-id', wid, '-display', X_DISPLAY, '_NET_WM_PID']);
-    const pm = prop.match(/_NET_WM_PID\s*\(\s*CARDINAL\s*\)\s*=\s*(\d+)/i);
-    if (pm && parseInt(pm[1]) === pid) {
-      return { w: parseInt(m[1]), h: parseInt(m[2]), x: parseInt(m[3]), y: parseInt(m[4]) };
-    }
-  }
-  return null;
-}
-
-function startScrcpy(maxSize, bitrate) {
-  if (!SCRCPY) {
-    console.error('[scrcpy] binary not found — set SCRCPY env');
-    return;
-  }
-  const args = [
-    '--max-size', String(maxSize),
-    '--video-bit-rate', bitrate,
-    '--no-audio', '--no-control'
-  ];
-  const proc = spawn(SCRCPY, args, {
-    env: { ...process.env, DISPLAY: X_DISPLAY },
-    stdio: ['ignore', 'ignore', 'pipe']
-  });
-  scrcpyProc = proc;
-  curScrcpyPgrp = proc.pid;
-  proc.stderr.on('data', () => {});
-  proc.on('close', (code) => {
-    // event from an instance killed during a resolution switch: the current one is already different
-    if (scrcpyProc !== proc) return;
-    console.log('[bridge] scrcpy exited, code:', code);
-    scrcpyProc = null;
-    curScrcpyPgrp = 0;
-    ensureDeviceWatch();
-  });
-  curW = 0; curH = 0; curX = 0; curY = 0;
-  console.log(`[bridge] scrcpy started, max-size=${maxSize} bitrate=${bitrate}`);
-  const poll = async () => {
-    if (!scrcpyProc) return;
-    const win = await detectScrcpyWindow();
-    if (win) {
-      curW = win.w; curH = win.h; curX = win.x; curY = win.y;
-      execCmd('xdotool', ['mousemove', '0', '0']);
-      console.log(`[bridge] scrcpy window: ${curW}x${curH}+${curX},${curY}`);
-      if (streaming && clientsByCodec('webp').length > 0) startFfmpeg();
-      // the window may keep settling after the connection (256x256 at boot) — keep watching
-      const watch = async () => {
-        if (!scrcpyProc) return;
-        const w = await detectScrcpyWindow();
-        if (w && (w.w !== curW || w.h !== curH || w.x !== curX || w.y !== curY)) {
-          curW = w.w; curH = w.h; curX = w.x; curY = w.y;
-          console.log(`[bridge] scrcpy window changed: ${curW}x${curH}+${curX},${curY}`);
-          if (streaming && clientsByCodec('webp').length > 0) startFfmpeg();
-        }
-        setTimeout(watch, 2000);
-      };
-      setTimeout(watch, 2000);
-    } else {
-      setTimeout(poll, 500);
-    }
-  };
-  setTimeout(poll, 1000);
-}
-
-function stopScrcpy() {
-  scrcpyProc = null;
-  if (curScrcpyPgrp) {
-    try { process.kill(curScrcpyPgrp, 'SIGKILL'); } catch (e) {}
-    exec(`pkill -9 -P ${curScrcpyPgrp} 2>/dev/null`, () => {});
-    console.log(`[bridge] scrcpy stopping, killed ${curScrcpyPgrp}`);
-  }
-  curScrcpyPgrp = 0;
-}
-
-function startFfmpeg() {
-  stopFfmpeg();
-  const cfg = RESOLUTIONS[curRes];
-  const args = [
-    '-y', '-f', 'x11grab',
-    '-video_size', `${curW}x${curH}`,
-    '-framerate', String(cfg.fps),
-    '-i', `${X_DISPLAY}.0+${curX},${curY}`,
-    '-c:v', 'libwebp', '-q:v', String(WEBP_QUALITY), '-compression_level', '1',
-    '-f', 'image2pipe', 'pipe:1'
-  ];
-  const proc = spawn(FFMPEG, args, {
-    env: { ...process.env, DISPLAY: X_DISPLAY },
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  ffmpegProc = proc;
-  proc.stderr.on('data', () => {});
-
-  const RIFF = Buffer.from('RIFF');
-  const WEBP = Buffer.from('WEBP');
-  let buffer = Buffer.alloc(0);
-
-  proc.stdout.on('data', (chunk) => {
-    // frames from an instance replaced during an ffmpeg restart are not sent to clients
-    if (ffmpegProc !== proc) return;
-    buffer = Buffer.concat([buffer, chunk]);
-    while (true) {
-      const riff = buffer.indexOf(RIFF);
-      if (riff === -1) { buffer = Buffer.alloc(0); break; }
-      if (buffer.length < riff + 12) break;
-      if (buffer.compare(WEBP, 0, 4, riff + 8, riff + 12) !== 0) {
-        buffer = buffer.subarray(riff + 4);
-        continue;
-      }
-      const size = buffer.readUInt32LE(riff + 4) + 8;
-      if (buffer.length < riff + size) break;
-      const frame = Buffer.from(buffer.subarray(riff, riff + size));
-      buffer = buffer.subarray(riff + size);
-      if (frame.length > 100) {
-        broadcastWebp(frame);
-      }
-    }
-  });
-
-  proc.on('close', (code) => {
-    // event from an instance killed during an ffmpeg restart: the current one is already different,
-    // clearing the reference would kill the new process (the leaked ffmpeg would keep streaming)
-    if (ffmpegProc !== proc) return;
-    console.log('[bridge] ffmpeg exited, code:', code);
-    ffmpegProc = null;
-  });
-  console.log(`[bridge] ffmpeg started, ${curW}x${curH}+${curX},${curY} webp q${WEBP_QUALITY} @${cfg.fps}fps`);
-}
-
-function stopFfmpeg() {
-  if (!ffmpegProc) return;
-  const p = ffmpegProc;
-  ffmpegProc = null;
-  p.kill('SIGKILL');
-  console.log('[bridge] ffmpeg stopping');
 }
 
 // --- H.264: parsing the screenrecord Annex-B stream into access units (frames) ---
@@ -375,7 +211,7 @@ function stopScreenrecord() {
 }
 
 // --- scrcpy host: two instances of server 4.1 ---
-// video server (control=false): h264 stream only.
+// video server (control=false, audio=opus): h264 + opus streams.
 // control server (video=false): input + clipboard, coordinates = display pixels.
 // Why two: with video=true the server maps touch coordinates from the video-frame space
 // via PositionMapper, and display pixels do not arrive (verified: a swipe from the status
@@ -383,17 +219,20 @@ function stopScreenrecord() {
 // also survives video resolution switches.
 
 // Protocol (empirically confirmed on v4.1, jar decompilation + C client):
-//   reverse localabstract:scrcpy_<scid-hex> -> the server connects its own sockets
-//   video: [64B name][4B 'h264'][12B session: u64(0x80..|w)+u32 h]
+//   reverse localabstract:scrcpy_<scid-hex> -> the server connects its own sockets,
+//   in a fixed order: video, then audio (each enabled stream = one connection)
+//   video (1st socket): [64B name][4B 'h264'][12B session: u64(0x80..|w)+u32 h]
 //          then packets [u64 pts_flags][u32 size][Annex-B]: bit62=config, bit61=keyframe
+//   audio (2nd socket): [4B 'opus'] then the same packet framing:
+//          bit62=config -> OpusHead (19B), data packets = raw opus @48kHz stereo
 //   control: the client writes messages; the device answers with device messages
 //          [1B type]; type0=clipboard [4B len][utf8], type1=ack [8B seq]
 
 const SCID_VIDEO = '77656231';
 const SCID_CTRL = '77656232';
 
-function makeScrcpyInstance({ scid, video, label, onSocket, onDied, skipPush }) {
-  const st = { token: 0, proc: null, sock: null, listenSrv: null };
+function makeScrcpyInstance({ scid, video, audio, label, onSocket, onAudioSocket, onDied, skipPush }) {
+  const st = { token: 0, proc: null, sock: null, audioSock: null, listenSrv: null };
   return {
     running() { return !!st.proc; },
     sock() { return st.sock; },
@@ -401,17 +240,25 @@ function makeScrcpyInstance({ scid, video, label, onSocket, onDied, skipPush }) 
       this.stop();
       const token = ++st.token;
       st.listenSrv = net.createServer((sock) => {
-        if (token !== st.token || st.sock) { sock.destroy(); return; }
-        st.sock = sock;
-        sock.on('data', (chunk) => { if (token === st.token) onSocket(chunk); });
+        if (token !== st.token) { sock.destroy(); return; }
+        // the server connects in a fixed order: video first, then audio
+        const isAudio = !!audio && !!st.sock;
+        const slot = isAudio ? 'audioSock' : 'sock';
+        if (st[slot]) { sock.destroy(); return; }
+        st[slot] = sock;
+        sock.on('data', (chunk) => {
+          if (token !== st.token) return;
+          (isAudio ? onAudioSocket : onSocket)(chunk);
+        });
         sock.on('close', () => {
-          if (token !== st.token || st.sock !== sock) return;
-          console.log(`[scrcpy:${label}] socket closed`);
-          st.sock = null;
-          onDied('socket closed');
+          if (token !== st.token || st[slot] !== sock) return;
+          console.log(`[scrcpy:${label}] ${isAudio ? 'audio ' : ''}socket closed`);
+          st[slot] = null;
+          // audio ending is not fatal (capture may fail on the device) — video keeps streaming
+          if (!isAudio) onDied('socket closed');
         });
         sock.on('error', () => {});
-        console.log(`[scrcpy:${label}] socket up`);
+        console.log(`[scrcpy:${label}] ${isAudio ? 'audio ' : ''}socket up`);
       });
       st.listenSrv.listen(0, '127.0.0.1', () => {
         if (token !== st.token) { st.listenSrv.close(); return; }
@@ -424,12 +271,13 @@ function makeScrcpyInstance({ scid, video, label, onSocket, onDied, skipPush }) 
               'CLASSPATH=/data/local/tmp/scrcpy-server.jar',
               'app_process / com.genymobile.scrcpy.Server 4.1',
               'log_level=warn',
-              `video=${video}`, 'audio=false', `control=${!video}`,
+              `video=${video}`, audio ? 'audio=true' : 'audio=false', `control=${!video}`,
             ];
             if (video) {
               const cfg = RESOLUTIONS[curRes];
               args.push(`max_size=${encSizeMax(cfg)}`, `max_fps=${cfg.fps}`,
-                `video_bit_rate=${parseInt(cfg.bitrate, 10) * 1000000}`);
+                `video_bit_rate=${parseInt(cfg.bitrate, 10) * 1000000}`,
+                'audio_codec=opus');
             }
             args.push(`scid=${scid}`, 'cleanup=false');
             const proc = spawn(ADB, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -463,8 +311,10 @@ function makeScrcpyInstance({ scid, video, label, onSocket, onDied, skipPush }) 
       st.token++;
       st.proc = null;
       st.sock = null;
+      st.audioSock = null;
       st.listenSrv = null;
       if (h.sock) h.sock.destroy();
+      if (h.audioSock) h.audioSock.destroy();
       if (h.listenSrv) h.listenSrv.close();
       if (h.proc) {
         h.proc.kill('SIGKILL');
@@ -484,6 +334,7 @@ let videoRespawnTimer = null;
 const videoHost = makeScrcpyInstance({
   scid: SCID_VIDEO,
   video: true,
+  audio: true,
   label: 'video',
   onDied(why) {
     console.log('[scrcpy:video] died:', why);
@@ -495,12 +346,15 @@ const videoHost = makeScrcpyInstance({
     }
   },
   onSocket: parseVideoStream,
+  onAudioSocket: parseAudioStream,
 });
 
 function startVideoHost() {
   clearTimeout(videoRespawnTimer);
   videoBuf = Buffer.alloc(0);
   videoHandshaked = false;
+  audioBuf = Buffer.alloc(0);
+  audioHandshaked = false;
   videoHost.start();
 }
 
@@ -542,6 +396,39 @@ function parseVideoStream(chunk) {
       if (isKey) lastKeyAU = { msg, ts: Date.now() };
       broadcastH264(msg);
     }
+  }
+}
+
+// --- audio instance stream (same socket pair as video): opus @48kHz ---
+// to the browser, over the WS: [0x02][opus packet] and [0x03][OpusHead config]
+
+let audioBuf = Buffer.alloc(0);
+let audioHandshaked = false;
+
+function broadcastAudio(msg) {
+  for (const ws of clientsByCodec('h264')) ws.send(msg);
+}
+
+function parseAudioStream(chunk) {
+  audioBuf = audioBuf.length ? Buffer.concat([audioBuf, chunk]) : chunk;
+  if (!audioHandshaked) {
+    if (audioBuf.length < 4) return;
+    const codec = audioBuf.subarray(0, 4).toString();
+    if (codec !== 'opus') { console.error('[scrcpy:audio] unexpected codec:', codec); stopVideoHost(); return; }
+    audioHandshaked = true;
+    audioBuf = audioBuf.subarray(4);
+    console.log('[scrcpy:audio] stream up');
+  }
+  while (audioBuf.length >= 12) {
+    const f0 = audioBuf[0];
+    const size = audioBuf.readUInt32BE(8);
+    if (audioBuf.length < 12 + size) break;
+    const payload = Buffer.from(audioBuf.subarray(12, 12 + size));
+    audioBuf = audioBuf.subarray(12 + size);
+    const msg = Buffer.allocUnsafe(payload.length + 1);
+    msg[0] = (f0 & 0x40) ? 3 : 2;
+    payload.copy(msg, 1);
+    broadcastAudio(msg);
   }
 }
 
@@ -624,13 +511,13 @@ function parseDeviceMessages(chunk) {
 // the position in v4.1 control messages — raw pixels (verified: a swipe from the status bar
 // opens the notification shade only with pixel coordinates; normalized 16.16 does not work)
 
-function injectTouch(action, x, y, pressure) {
+function injectTouch(action, x, y, pressure, pointerId = -1) {
   if (!ctrlReady()) return false;
   const b = Buffer.alloc(32);
   let o = 0;
   b[o++] = 2;                          // TYPE_INJECT_TOUCH_EVENT
-  b[o++] = action;                     // 0=DOWN 1=UP 2=MOVE
-  b.writeBigInt64BE(-1n, o); o += 8;   // pointer id: generic finger
+  b[o++] = action;                     // 0=DOWN 1=UP 2=MOVE 5=POINTER_DOWN 6=POINTER_UP
+  b.writeBigInt64BE(BigInt(pointerId), o); o += 8;   // pointer id (-1 = generic finger)
   b.writeUInt32BE(x, o); o += 4;
   b.writeUInt32BE(y, o); o += 4;
   b.writeUInt16BE(1080, o); o += 2;
@@ -639,6 +526,30 @@ function injectTouch(action, x, y, pressure) {
   b.writeUInt32BE(1, o); o += 4;       // actionButton: PRIMARY (0 does not work — verified)
   b.writeUInt32BE(action === 0 || action === 2 ? 1 : 0, o); // buttons
   ctrlHost.sock().write(b);
+  return true;
+}
+
+// Two-finger pinch (scrcpy multitouch, no adb fallback): fingers start 100px from the center
+// and move apart to dist/2 (dist > 200 — zoom in, < 200 — zoom out). Action codes follow
+// Android MotionEvent: 0=DOWN, 1=UP, 2=MOVE, 5=POINTER_DOWN, 6=POINTER_UP.
+function injectPinch(x, y, dist, ms) {
+  if (!ctrlReady()) return false;
+  const cx = Math.max(0, Math.min(1080, x));
+  const cy = Math.max(0, Math.min(2400, y));
+  const halfEnd = Math.max(25, Math.min(1200, dist / 2));
+  const halfStart = 100;
+  const halfAt = (t) => Math.round(halfStart + (halfEnd - halfStart) * t);
+  const py = (t, sign) => Math.max(0, Math.min(2400, cy + sign * halfAt(t)));
+  injectTouch(0, cx, py(0, -1), true, 0);
+  injectTouch(5, cx, py(0, 1), true, 1);
+  const steps = 10;
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    setTimeout(() => injectTouch(2, cx, py(t, -1), true, 0), ms * t);
+    setTimeout(() => injectTouch(2, cx, py(t, 1), true, 1), ms * t + 8);
+  }
+  setTimeout(() => injectTouch(6, cx, py(1, 1), false, 1), ms + 30);
+  setTimeout(() => injectTouch(1, cx, py(1, -1), false, 0), ms + 70);
   return true;
 }
 
@@ -751,7 +662,12 @@ let deviceWatchTimer = null;
 function ensureDeviceWatch() {
   if (deviceWatchTimer) return;
   deviceWatchTimer = setInterval(async () => {
-    if (scrcpyProc && (VIDEO_SRC === 'screenrecord' || !clientsByCodec('h264').length || videoHost.running())) {
+    if (VIDEO_SRC === 'scrcpy' && videoHost.running()) {
+      clearInterval(deviceWatchTimer);
+      deviceWatchTimer = null;
+      return;
+    }
+    if (VIDEO_SRC === 'screenrecord' && srProc) {
       clearInterval(deviceWatchTimer);
       deviceWatchTimer = null;
       return;
@@ -762,8 +678,6 @@ function ensureDeviceWatch() {
     clearInterval(deviceWatchTimer);
     deviceWatchTimer = null;
     console.log('[bridge] device back, restarting streams');
-    const cfg = RESOLUTIONS[curRes];
-    startScrcpy(encSizeMax(cfg), cfg.bitrate);
     if (VIDEO_SRC === 'scrcpy' && clientsByCodec('h264').length > 0) startVideoHost();
     if (clients.size > 0) startCtrlHost();
   }, 3000);
@@ -773,13 +687,10 @@ function changeResolution(name) {
   const cfg = RESOLUTIONS[name];
   if (!cfg) return false;
   if (name === curRes) return true;
-  stopFfmpeg();
-  stopScrcpy();
   curRes = name;
   lastKeyAU = null;
   const note = JSON.stringify({ type: 'res', name });
   for (const cl of clients) if (cl.readyState === 1) cl.send(note);
-  startScrcpy(encSizeMax(cfg), cfg.bitrate);
   if (VIDEO_SRC === 'scrcpy') {
     if (clientsByCodec('h264').length > 0) startVideoHost();
   } else if (clientsByCodec('h264').length > 0) {
@@ -893,6 +804,11 @@ async function handleInputMsg(ws, d) {
         case 'scroll':
           injectScroll(d.x, d.y, d.dy || 1);
           return;
+        case 'pinch':
+          if (!injectPinch(d.x, d.y, d.dist || 400, d.ms || 500)) {
+            console.error('[input] pinch: control channel not ready');
+          }
+          return;
       }
     }
     switch (d.type) {
@@ -938,8 +854,29 @@ function authorized(req, url) {
   return q === WEB_ACCESS_TOKEN || h === WEB_ACCESS_TOKEN;
 }
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+// --- TLS: self-signed cert so the page is a secure context (WebCodecs needs HTTPS) ---
+// Generated on first start, cached in the state dir; the user trusts it once in the browser.
+function ensureTlsCert() {
+  const dir = path.join(os.homedir(), '.local', 'state', 'droidlab');
+  fs.mkdirSync(dir, { recursive: true });
+  const keyPath = path.join(dir, 'bridge.key');
+  const crtPath = path.join(dir, 'bridge.crt');
+  if (fs.existsSync(keyPath) && fs.existsSync(crtPath)) {
+    return { key: fs.readFileSync(keyPath), cert: fs.readFileSync(crtPath) };
+  }
+  const cn = 'droidlab.local';
+  execSync(`openssl req -x509 -newkey rsa:2048 -nodes -keyout "${keyPath}" -out "${crtPath}" ` +
+    `-days 825 -subj "/CN=${cn}" -addext "subjectAltName=DNS:${cn},IP:192.168.1.112,IP:127.0.0.1"`, { stdio: 'pipe' });
+  return { key: fs.readFileSync(keyPath), cert: fs.readFileSync(crtPath) };
+}
+
+let server, wss;
+let usingTls = false;
+try {
+  const tls = ensureTlsCert();
+  usingTls = true;
+  server = https.createServer(tls, async (req, res) => {
+    const url = new URL(req.url, `https://${req.headers.host}`);
   const pathname = url.pathname;
 
   if (!authorized(req, url)) {
@@ -948,7 +885,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === '/' || pathname === '/index.html') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache, no-store, must-revalidate' });
     res.end(fs.readFileSync(path.join(__dirname, 'index.html')));
     return;
   }
@@ -1013,9 +950,23 @@ const server = http.createServer(async (req, res) => {
   }
   res.writeHead(404);
   res.end();
-});
-
-const wss = new WebSocketServer({ noServer: true });
+  });
+  wss = new WebSocketServer({ noServer: true });
+} catch (e) {
+  console.error('[bridge] TLS unavailable (' + e.message + '), falling back to http');
+  server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const pathname = url.pathname;
+    if (!authorized(req, url)) { json(res, 401, { error: 'unauthorized' }); return; }
+    if (pathname === '/' || pathname === '/index.html') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache, no-store, must-revalidate' });
+      res.end(fs.readFileSync(path.join(__dirname, 'index.html')));
+      return;
+    }
+    res.writeHead(404); res.end();
+  });
+  wss = new WebSocketServer({ noServer: true });
+}
 
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://localhost');
@@ -1028,7 +979,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', (ws) => {
-  ws.codec = 'webp';
+  ws.codec = 'none';
   ws.rttMin = Infinity;
   ws.rttSlow = 0;
   ws.on('pong', (data) => {
@@ -1042,7 +993,7 @@ wss.on('connection', (ws) => {
     try { d = JSON.parse(data.toString()); } catch { return; }
     if (d.type === 'init') {
       ws.isController = !!(WEB_CONTROL_TOKEN && d.token && d.token === WEB_CONTROL_TOKEN);
-      ws.codec = d.codec === 'h264' ? 'h264' : (d.codec === 'webp' ? 'webp' : 'none');
+      ws.codec = d.codec === 'h264' ? 'h264' : 'none';
       console.log(`[bridge] client codec: ${ws.codec}${ws.isController ? ' (controller)' : ''}`);
       ws.send(JSON.stringify({ type: 'input-mode', enabled: devInputEnabled }));
       if (ws.codec === 'h264') {
@@ -1054,7 +1005,7 @@ wss.on('connection', (ws) => {
             ws.send(lastKeyAU.msg);
           }
           if (!videoHost.running()) startVideoHost();
-      setTimeout(() => { if (clients.size > 0 && !ctrlHost.running()) startCtrlHost(); }, 600);
+          setTimeout(() => { if (clients.size > 0 && !ctrlHost.running()) startCtrlHost(); }, 600);
         } else {
           const fresh = lastKeyAU && Date.now() - lastKeyAU.ts < 1500;
           if (fresh) {
@@ -1063,9 +1014,6 @@ wss.on('connection', (ws) => {
             startScreenrecord();
           }
         }
-      } else if (ws.codec === 'webp' && !streaming) {
-        streaming = true;
-        if (!ffmpegProc && curW > 0) startFfmpeg();
       }
       return;
     }
@@ -1082,10 +1030,6 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     clients.delete(ws);
     console.log('[bridge] client left, total:', clients.size);
-    if (clientsByCodec('webp').length === 0) {
-      streaming = false;
-      stopFfmpeg();
-    }
     if (clientsByCodec('h264').length === 0) {
       if (VIDEO_SRC === 'scrcpy') stopVideoHost();
       else stopScreenrecord();
@@ -1094,11 +1038,9 @@ wss.on('connection', (ws) => {
   });
 });
 
-const cfg = RESOLUTIONS[DEFAULT_RES];
-startScrcpy(encSizeMax(cfg), cfg.bitrate);
 server.listen(PORT, HOST, () => {
-  console.log(`[bridge] http://${HOST}:${PORT} (X: ${X_DISPLAY}, res: ${curRes}, input: ${devInputEnabled ? 'on' : 'off'})`);
+  console.log(`[bridge] ${usingTls ? 'https' : 'http'}://${HOST}:${PORT} (res: ${curRes}, input: ${devInputEnabled ? 'on' : 'off'})`);
 });
 
-process.on('SIGINT', () => { stopFfmpeg(); stopScrcpy(); stopScreenrecord(); stopVideoHost(); stopCtrlHost(); process.exit(0); });
-process.on('SIGTERM', () => { stopFfmpeg(); stopScrcpy(); stopScreenrecord(); stopVideoHost(); stopCtrlHost(); process.exit(0); });
+process.on('SIGINT', () => { stopScreenrecord(); stopVideoHost(); stopCtrlHost(); process.exit(0); });
+process.on('SIGTERM', () => { stopScreenrecord(); stopVideoHost(); stopCtrlHost(); process.exit(0); });

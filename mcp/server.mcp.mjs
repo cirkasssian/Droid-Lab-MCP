@@ -22,7 +22,6 @@ const CAPTURES_DIR = path.join(PROJECT_HOME, 'shots');
 const EMULATOR_REGISTRY = path.join(PROJECT_HOME, 'mcp', 'emulators.json');
 
 const RELAY_PORT = parseInt(process.env.BRIDGE_PORT || '8090', 10);
-const XVFB_SCREEN = process.env.X_DISPLAY || ':99';
 const PREFERRED_AVD = process.env.EMU_AVD || null;
 const EMU_APPEND_ARGS = process.env.EMU_EXTRA_ARGS || '';
 const BOOT_DEADLINE_MS = parseInt(process.env.BOOT_TIMEOUT_MS || '120000', 10);
@@ -269,9 +268,12 @@ const readRelayState = () => {
 
 const awaitHttpUp = async (url, timeoutMs) => {
   const t0 = Date.now();
+  const isHttps = url.startsWith('https:');
+  const mod = isHttps ? https : http;
   while (Date.now() - t0 < timeoutMs) {
     const ok = await new Promise((resolve) => {
-      const req = http.get(url, { timeout: 2000 }, (res) => { res.resume(); resolve(res.statusCode === 200); });
+      const opts = { timeout: 2000, ...(isHttps ? { rejectUnauthorized: false } : {}) };
+      const req = mod.get(url, opts, (res) => { res.resume(); resolve(res.statusCode === 200); });
       req.on('error', () => resolve(false));
       req.on('timeout', () => { req.destroy(); resolve(false); });
     });
@@ -291,7 +293,6 @@ const bootRelay = async (host) => {
       PORT: String(RELAY_PORT),
       WEB_CONTROL_TOKEN: token,
       WEB_ACCESS_TOKEN: accessToken,
-      X_DISPLAY: XVFB_SCREEN,
       ADB: ADB_EXEC,
       ...(scrcpyPathsCache ? { SCRCPY: scrcpyPathsCache.scrcpy, SCRCPY_SERVER: scrcpyPathsCache.server } : {}),
     },
@@ -299,7 +300,7 @@ const bootRelay = async (host) => {
   });
   persistPid('bridge', child.pid);
   fs.writeFileSync(RELAY_STATE, JSON.stringify({ token, accessToken, host, port: RELAY_PORT, pid: child.pid }));
-  await awaitHttpUp(`http://127.0.0.1:${RELAY_PORT}/state?token=${encodeURIComponent(accessToken)}`, 15000);
+  await awaitHttpUp(`https://127.0.0.1:${RELAY_PORT}/state?token=${encodeURIComponent(accessToken)}`, 15000);
   return child.pid;
 };
 
@@ -336,7 +337,7 @@ const teardownRelay = () => {
 const relayEndpoint = (info) => {
   const port = info?.port || RELAY_PORT;
   const token = info?.accessToken ? `?token=${encodeURIComponent(info.accessToken)}` : '';
-  return `ws://127.0.0.1:${port}/${token}`;
+  return `wss://127.0.0.1:${port}/${token}`;
 };
 
 const obtainRelay = async () => {
@@ -353,7 +354,7 @@ const dialRelay = async () => {
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       return await new Promise((resolve, reject) => {
-        const sock = new WebSocket(relayEndpoint(info));
+        const sock = new WebSocket(relayEndpoint(info), { rejectUnauthorized: false });
         sock.on('open', () => {
           sock.send(JSON.stringify({ type: 'init', codec: 'none', token: info?.token }));
           relaySock = sock;
@@ -404,7 +405,7 @@ const assertRelayOwned = () => {
   return info;
 };
 
-// --- emulator and Xvfb lifecycle ---
+// --- emulator lifecycle ---
 
 const emuProcessState = async (avd) => {
   const pid = fetchPid('emulator');
@@ -416,13 +417,6 @@ const emuProcessState = async (avd) => {
   const serial = await primaryEmuSerial();
   if (serial && await deviceBooted()) return { running: true, ours: false, adopted: true };
   return { running: false };
-};
-
-const xvfbAlive = async () => {
-  const pid = fetchPid('xvfb');
-  if (pid && processAlive(pid)) return true;
-  const dispNum = XVFB_SCREEN.replace(/^:/, '').split('.')[0];
-  try { return fs.existsSync(path.join('/tmp', '.X11-unix', `X${dispNum}`)); } catch { return false; }
 };
 
 const awaitBoot = async (timeoutMs, extra) => {
@@ -539,7 +533,7 @@ const relayJson = async (pathname) => {
   const info = readRelayState();
   const auth = info?.accessToken ? `${pathname.includes('?') ? '&' : '?'}token=${encodeURIComponent(info.accessToken)}` : '';
   const res = await new Promise((resolve, reject) => {
-    const req = http.get({ host: '127.0.0.1', port: info?.port || RELAY_PORT, path: pathname + auth, timeout: 4000 }, resolve);
+    const req = https.get({ host: '127.0.0.1', port: info?.port || RELAY_PORT, path: pathname + auth, timeout: 4000, rejectUnauthorized: false }, resolve);
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
   });
@@ -569,12 +563,10 @@ const collectStatus = async () => {
   const relayInfo = readRelayState();
   const relayProc = fetchPid('bridge');
   const emuProc = fetchPid('emulator');
-  const xvfbProc = fetchPid('xvfb');
   const status = {
     processes: {
       bridge: relayProc && processAlive(relayProc) ? { pid: relayProc } : null,
       emulator: emuProc && processAlive(emuProc) ? { pid: emuProc } : null,
-      xvfb: xvfbProc && processAlive(xvfbProc) ? { pid: xvfbProc } : null,
     },
     bridge: null,
     adb: null,
@@ -622,7 +614,7 @@ const renderStatus = (s) => {
   return lines.join('\n');
 };
 
-const mcp = new McpServer({ name: 'droidlab', version: '1.1.0' });
+const mcp = new McpServer({ name: 'droidlab', version: '1.3.0' });
 
 let startGate = false; // mutex: parallel env_start calls conflict over pidfiles and spawn
 
@@ -633,7 +625,7 @@ mcp.registerTool(
   'env_start',
   {
     title: 'Start emulator environment',
-    description: 'Start the environment: Xvfb (Linux) + Android emulator (cold boot, the device state after env_stop is lost) + bridge on loopback. The first start takes ~30-60s (boot). If the emulator is already running — returns status (idempotent); for a different AVD run env_stop first. The bridge starts with browser input disabled until set_dev_input(true). Self-bootstrap: a missing AVD is created automatically (google_apis image for the host ABI is downloaded via sdkmanager, SDK licenses auto-accepted); missing cmdline-tools, java (Android Studio JBR) or scrcpy are downloaded/fetched too — network access is required.',
+    description: 'Start the environment: Android emulator (cold boot, the device state after env_stop is lost) + bridge on loopback. The first start takes ~30-60s (boot). If the emulator is already running — returns status (idempotent); for a different AVD run env_stop first. The bridge starts with browser input disabled until set_dev_input(true). Self-bootstrap: a missing AVD is created automatically (google_apis image for the host ABI is downloaded via sdkmanager, SDK licenses auto-accepted); missing cmdline-tools, java (Android Studio JBR) or scrcpy are downloaded/fetched too — network access is required.',
     inputSchema: {
       avd: z.string().optional().describe('Name from mcp/emulators.json ("android-13") or raw AVD name ("API33"). Default: EMU_AVD env, otherwise the first entry in the config.'),
     },
@@ -657,18 +649,9 @@ mcp.registerTool(
       if (!emu.running) {
         bootstrapLog.push(...await ensureAvd(avdName, entry, extra));
 
-        if (process.platform !== 'linux') {
-          // Xvfb is only needed for the webp fallback (x11grab); the h264 path does without it
-          console.error('[env] non-Linux: Xvfb skipped (webp-fallback unavailable)');
-        } else if (!(await xvfbAlive())) {
-          const xvfb = launchDetached('Xvfb', [XVFB_SCREEN, '-screen', '0', '1080x2400x24'], { logName: 'xvfb.log' });
-          persistPid('xvfb', xvfb.pid);
-          await pause(800);
-        }
-
         const args = [
           '-avd', avdName,
-          '-no-window', '-no-audio', '-gpu', 'off', '-no-snapshot',
+          '-no-window', '-gpu', 'off', '-no-snapshot',
           '-memory', '2048', '-cores', '4',
           ...EMU_APPEND_ARGS.split(/\s+/).filter(Boolean),
         ];
@@ -733,8 +716,8 @@ mcp.registerTool(
   'env_stop',
   {
     title: 'Stop emulator environment',
-    description: 'Stop the bridge, the emulator (adb emu kill, then forcibly) and Xvfb. Safe shutdown: processes from pidfiles are verified by cmdline; an external emulator (started not via env_start) is left alone if it is not in a pidfile — except adb emu kill, which by definition targets the emulator.',
-    inputSchema: {},
+    description: 'Stop the bridge, the emulator (adb emu kill, then forcibly). Safe shutdown: processes from pidfiles are verified by cmdline; an external emulator (started not via env_start) is left alone if it is not in a pidfile — except adb emu kill, which by definition targets the emulator.',
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -783,12 +766,6 @@ mcp.registerTool(
         stopped.push('emulator (pidfile absent — external or already stopped)');
       }
 
-      const xvfbPid = fetchPid('xvfb');
-      if (xvfbPid && process.platform === 'linux') {
-        if (await terminateTree(xvfbPid, 'Xvfb')) stopped.push(`xvfb (pid ${xvfbPid})`);
-        dropPid('xvfb');
-      }
-
       return replyText(`Stopped:\n- ${stopped.join('\n- ')}`);
     } catch (e) { return replyError(e); }
   },
@@ -815,15 +792,14 @@ mcp.registerTool(
   'env_status',
   {
     title: 'Environment status',
-    description: 'Environment status: processes (bridge/emulator/xvfb), the device (boot, Android version, screen, foreground app), input mode, bridge address.',
-    inputSchema: {},
+    description: 'Environment status: processes (bridge/emulator), the device (boot, Android version, screen, foreground app), input mode, bridge address.',
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       summary: z.string(),
       processes: z.object({
         bridge: z.object({ pid: z.number() }).nullable(),
         emulator: z.object({ pid: z.number() }).nullable(),
-        xvfb: z.object({ pid: z.number() }).nullable(),
       }),
       bridge: z.object({
         up: z.boolean(),
@@ -861,7 +837,7 @@ mcp.registerTool(
   {
     title: 'List emulators',
     description: 'Entries of mcp/emulators.json + all AVDs discovered in the SDK (emulator -list-avds).',
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       configured: z.array(z.object({ name: z.string(), avd: z.string(), note: z.string().optional() })),
@@ -1094,7 +1070,7 @@ mcp.registerTool(
   {
     title: 'List Android system images',
     description: 'Android system images: installed (from the SDK directory) and available for download (sdkmanager --list).',
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       installed: z.array(z.string()),
@@ -1199,7 +1175,7 @@ mcp.registerTool(
   {
     title: 'Device screenshot',
     description: 'Screenshot of the device screen at full resolution (adb screencap PNG, ~1080x2400): the full PNG is saved to shots/, and a downscaled JPEG (~720x1600) is returned in the response. Multiply UI coordinates from the downscaled image by 1.5 for tap/swipe (native pixels). ui_dump is faster for exact element coordinates.',
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1349,7 +1325,7 @@ mcp.registerTool(
   {
     title: 'Get device clipboard',
     description: 'Read the device clipboard. Note: scrcpy suppresses re-sending UNCHANGED text — if the buffer has not changed since the last read, the response will not arrive within 5s (a note about it is returned; the control channel may also simply be busy). Parallel calls are serialized.',
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1661,8 +1637,9 @@ const unquoteAttr = (line, prefix) => {
 };
 
 const treeLineHit = (line, matchers) => {
-  if (matchers.text && !unquoteAttr(line, 'text=').includes(matchers.text.toLowerCase())) return false;
-  if (matchers.desc && !unquoteAttr(line, 'desc=').includes(matchers.desc.toLowerCase())) return false;
+  // the prefix must include the opening JSON quote — unquoteAttr stops at the first quote
+  if (matchers.text && !unquoteAttr(line, 'text="').includes(matchers.text.toLowerCase())) return false;
+  if (matchers.desc && !unquoteAttr(line, 'desc="').includes(matchers.desc.toLowerCase())) return false;
   if (matchers.rid && !line.toLowerCase().includes(matchers.rid.toLowerCase())) return false;
   return true;
 };
@@ -1672,7 +1649,7 @@ mcp.registerTool(
   {
     title: 'Dump UI hierarchy',
     description: 'Tree of visible UI elements (uiautomator dump): class, text/content-desc, resource-id, clickable/scrollable, bounds + element center in native pixels — exact coordinates for tap/swipe without guessing from a screenshot. The full XML is saved to shots/uidump-*.xml.',
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1744,14 +1721,13 @@ mcp.registerTool(
   {
     title: 'Device state',
     description: 'Full state: process(es), boot, Android/API version, screen, stream resolution, foreground app, input mode.',
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       summary: z.string(),
       processes: z.object({
         bridge: z.object({ pid: z.number() }).nullable(),
         emulator: z.object({ pid: z.number() }).nullable(),
-        xvfb: z.object({ pid: z.number() }).nullable(),
       }),
       bridge: z.object({
         up: z.boolean(),
@@ -1796,7 +1772,7 @@ mcp.registerTool(
   {
     title: 'Enable LAN access',
     description: 'Restart the bridge listening on all interfaces (0.0.0.0) and return a URL for the developer: live video + input in the browser (input — after set_dev_input(true)). Access is protected by an access token (generated at bridge start, passed in the URL). The input mode after the restart is reset to "observation".',
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1810,7 +1786,7 @@ mcp.registerTool(
       const urls = [];
       for (const ifaces of Object.values(os.networkInterfaces())) {
         for (const i of ifaces || []) {
-          if (i.family === 'IPv4' && !i.internal) urls.push(`http://${i.address}:${RELAY_PORT}/${accessToken ? `?token=${accessToken}` : ''}`);
+          if (i.family === 'IPv4' && !i.internal) urls.push(`https://${i.address}:${RELAY_PORT}/${accessToken ? `?token=${accessToken}` : ''}`);
         }
       }
       return replyText([
@@ -1828,13 +1804,53 @@ mcp.registerTool(
   {
     title: 'Disable LAN access',
     description: 'Return the bridge to loopback: access from the developer network is cut off (the stream will break). MCP continues to operate the device.',
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
     try {
       await cycleRelay('127.0.0.1');
       return replyText(`Access closed: the bridge listens on 127.0.0.1:${RELAY_PORT} (local only).`);
+    } catch (e) { return replyError(e); }
+  },
+);
+
+mcp.registerTool(
+  'bridge_restart',
+  {
+    title: 'Restart the bridge',
+    description: 'Restart the relay/stream process (web/server.js) WITHOUT touching the emulator: applies bridge code changes and recovers a hung or dead bridge (boots one if none is running). Preserves the host binding (loopback / 0.0.0.0) and the developer-input mode; the access token is regenerated — hand the new URL from the reply to the developer. The browser video stream reconnects on page reload.',
+    inputSchema: z.object({}),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  async (_, extra) => {
+    try {
+      assertNotAborted(extra, 'bridge_restart');
+      const prev = readRelayState();
+      let inputWasOn = false;
+      try { inputWasOn = !!(await relayJson('/state')).inputEnabled; } catch {}
+      await cycleRelay(prev?.host || '127.0.0.1');
+      const state = await relayJson('/state');
+      let inputNote = 'browser input: disabled (default) — allow it: set_dev_input(true)';
+      if (inputWasOn) {
+        await relayWrite({ type: 'input-mode', enabled: true, token: readRelayState().token });
+        await pause(150);
+        inputNote = 'browser input: restored to ALLOWED';
+      }
+      const accessToken = readRelayState()?.accessToken;
+      const urls = [];
+      if (state.host === '0.0.0.0') {
+        for (const ifaces of Object.values(os.networkInterfaces())) {
+          for (const i of ifaces || []) {
+            if (i.family === 'IPv4' && !i.internal) urls.push(`https://${i.address}:${RELAY_PORT}/${accessToken ? `?token=${accessToken}` : ''}`);
+          }
+        }
+      }
+      return replyText([
+        `Bridge restarted (pid ${fetchPid('bridge')}), listening on ${state.host}:${RELAY_PORT}.`,
+        ...(urls.length ? ['New developer URL (token regenerated):', ...urls.map((u) => `- ${u}`)] : []),
+        inputNote,
+      ].join('\n'));
     } catch (e) { return replyError(e); }
   },
 );
@@ -1863,8 +1879,8 @@ mcp.registerTool(
       const info = readRelayState();
       const auth = info?.accessToken ? `&token=${encodeURIComponent(info.accessToken)}` : '';
       const res = await new Promise((resolve, reject) => {
-        const req = http.request(
-          { host: '127.0.0.1', port: RELAY_PORT, path: `/resolution?name=${encodeURIComponent(name)}${auth}`, method: 'POST', timeout: 8000 },
+        const req = https.request(
+          { host: '127.0.0.1', port: RELAY_PORT, path: `/resolution?name=${encodeURIComponent(name)}${auth}`, method: 'POST', timeout: 8000, rejectUnauthorized: false },
           resolve,
         );
         req.on('error', reject);
@@ -1889,7 +1905,7 @@ mcp.registerTool(
   {
     title: 'Reboot Android emulator',
     description: 'Reboot the device (adb reboot). App state is preserved (not a cold boot). Waits for boot ~120s (supports cancellation and progress). The bridge and the stream are restored automatically.',
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -1923,7 +1939,7 @@ mcp.registerTool(
   {
     title: 'Restart adb server',
     description: 'Restart the local adb server (adb kill-server + adb start-server): helps when adb is wedged — the device disappeared from `adb devices`, is stuck in offline/unauthorized, or port 5037 is held by a stale server. Connections and `adb reverse` tunnels drop for a few seconds; the bridge detects the loss and restarts its streams automatically once the device is back. The emulator, device state and files are NOT affected (this is not a device reboot — see reboot_emulator).',
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -1972,6 +1988,190 @@ mcp.registerTool(
       await pause(150);
       const st = await relayJson('/state');
       return replyText(`Browser input: ${st.inputEnabled ? 'ALLOWED' : 'disallowed (observation)'}`);
+    } catch (e) { return replyError(e); }
+  },
+);
+
+// --- shell / emulator console / diagnostics ---
+
+mcp.registerTool(
+  'shell',
+  {
+    title: 'Run adb shell command',
+    description: 'Run an arbitrary command on the device via adb shell (e.g. dumpsys battery, getprop, settings put/get, pm, ps, netstat, screenrecord). Prefer dedicated tools (tap, screenshot, logcat, …) when they cover the task; use shell for everything they miss.',
+    inputSchema: {
+      cmd: z.string().min(1).max(2000).describe('Shell command, e.g. "dumpsys battery"'),
+      timeout: z.number().int().min(1000).max(120000).optional().describe('Timeout, ms (default 20000)'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  },
+  async ({ cmd, timeout }, extra) => {
+    try {
+      assertNotAborted(extra, 'shell');
+      const serial = await primaryEmuSerial();
+      if (!serial) throw new Error('emulator not found — call env_start');
+      // adb propagates the remote exit code; a command may fail with no output at all (e.g. "false")
+      const { stdout, stderr, code } = await execCmd(ADB_EXEC, ['-s', serial, 'shell', cmd], { timeout: timeout ?? 20000 })
+        .catch((e) => ({ stdout: '', stderr: String(e.message || e), code: typeof e.code === 'number' ? e.code : 1 }));
+      const cap = (s) => s.length > 50000 ? s.slice(0, 50000) + `\n… truncated (${s.length - 50000} more chars)` : s;
+      let text = `exit=${code}\n--- stdout ---\n${cap(stdout)}`;
+      if (stderr.trim()) text += `\n--- stderr ---\n${cap(stderr)}`;
+      return replyText(text);
+    } catch (e) { return replyError(e); }
+  },
+);
+
+mcp.registerTool(
+  'emu',
+  {
+    title: 'Run emulator console command',
+    description: 'Run a command on the emulator console (adb emu): battery emulation ("power acu off", "power capacity 50"), network ("network speed edge", "network delay umts"), GSM voice/data ("gsm data home"), incoming call/SMS ("gsm call 555", "sms send 555 hi"), GPS ("geo fix 37.6 55.7"), rotate. Requires a running emulator.',
+    inputSchema: {
+      cmd: z.string().min(1).max(500).describe('Console command, e.g. "power capacity 50"'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+  },
+  async ({ cmd }, extra) => {
+    try {
+      assertNotAborted(extra, 'emu');
+      const serial = await primaryEmuSerial();
+      if (!serial) throw new Error('emulator not found — call env_start');
+      const args = cmd.trim().split(/\s+/);
+      const { stdout, stderr, code } = await execCmd(ADB_EXEC, ['-s', serial, 'emu', ...args], { timeout: 15000 });
+      return replyText(`exit=${code}\n${[stdout, stderr].map((s) => s.trim()).filter(Boolean).join('\n') || '(no output)'}`);
+    } catch (e) { return replyError(e); }
+  },
+);
+
+mcp.registerTool(
+  'bugreport',
+  {
+    title: 'Collect Android bugreport',
+    description: 'Collect a full Android bug report (adb bugreport → zip in shots/): device state, logs, dumpsys for all services. Takes 1–3 minutes. Use for deep diagnostics when logcat/shell are not enough. Returns the local zip path.',
+    inputSchema: z.object({}),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  async (_, extra) => {
+    try {
+      assertNotAborted(extra, 'bugreport');
+      const serial = await primaryEmuSerial();
+      if (!serial) throw new Error('emulator not found — call env_start');
+      fs.mkdirSync(CAPTURES_DIR, { recursive: true });
+      const out = path.join(CAPTURES_DIR, `bugreport-${new Date().toISOString().replace(/[:.]/g, '-')}.zip`);
+      await execCmd(ADB_EXEC, ['-s', serial, 'bugreport', out], { timeout: 240000, maxBuffer: 16 * 1024 * 1024 });
+      const size = fs.existsSync(out) ? fs.statSync(out).size : 0;
+      if (!size) throw new Error('bugreport failed — no zip produced');
+      return replyText(`bugreport saved: ${out} (${(size / 1024 / 1024).toFixed(1)} MB)`);
+    } catch (e) { return replyError(e); }
+  },
+);
+
+mcp.registerTool(
+  'app_uninstall',
+  {
+    title: 'Uninstall an app',
+    description: 'Uninstall a third-party app from the device (adb uninstall). System apps cannot be removed this way. Returns adb output ("Success" on success).',
+    inputSchema: {
+      package: z.string().regex(/^[\w.]+$/, 'package name like com.example.app'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  async ({ package: pkg }, extra) => {
+    try {
+      assertNotAborted(extra, 'app_uninstall');
+      const serial = await primaryEmuSerial();
+      if (!serial) throw new Error('emulator not found — call env_start');
+      const { stdout, stderr } = await execCmd(ADB_EXEC, ['-s', serial, 'uninstall', pkg], { timeout: 30000 });
+      return replyText([stdout.trim(), stderr.trim()].filter(Boolean).join('\n') || '(no output)');
+    } catch (e) { return replyError(e); }
+  },
+);
+
+mcp.registerTool(
+  'app_clear_data',
+  {
+    title: 'Clear app data',
+    description: 'Reset an app to its first-launch state (pm clear): wipes data, cache, logins and granted runtime permissions. Standard test hygiene between runs. Returns adb output ("Success" on success).',
+    inputSchema: {
+      package: z.string().regex(/^[\w.]+$/, 'package name like com.example.app'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  async ({ package: pkg }, extra) => {
+    try {
+      assertNotAborted(extra, 'app_clear_data');
+      const serial = await primaryEmuSerial();
+      if (!serial) throw new Error('emulator not found — call env_start');
+      const { stdout, stderr } = await execCmd(ADB_EXEC, ['-s', serial, 'shell', `pm clear ${pkg}`], { timeout: 30000 });
+      return replyText([stdout.trim(), stderr.trim()].filter(Boolean).join('\n') || '(no output)');
+    } catch (e) { return replyError(e); }
+  },
+);
+
+mcp.registerTool(
+  'bridge_logs',
+  {
+    title: 'Read host-side logs',
+    description: 'Read the tail of host-side log files from the state dir: file="bridge" — the relay/stream process (WS clients, scrcpy hosts, input errors); file="emulator" — the qemu console log; file="mcp" — this MCP server log. For on-device logs use logcat instead.',
+    inputSchema: {
+      file: z.enum(['bridge', 'emulator', 'mcp']).optional().describe('Which log to read (default bridge)'),
+      lines: z.number().int().min(1).max(400).optional().describe('Last N lines (default 80)'),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  async ({ file, lines }) => {
+    try {
+      const p = path.join(dataDir(), `${file || 'bridge'}.log`);
+      if (!fs.existsSync(p)) return replyText(`${p} does not exist yet.`);
+      const content = fs.readFileSync(p, 'utf8');
+      const all = content.split('\n');
+      const tail = all.slice(-(lines || 80)).join('\n');
+      return replyText(`${p} (${all.length} lines total, showing last ${tail.split('\n').length}):\n${tail}`);
+    } catch (e) { return replyError(e); }
+  },
+);
+
+mcp.registerTool(
+  'pinch',
+  {
+    title: 'Pinch-zoom gesture (two fingers)',
+    description: 'Two-finger pinch at a point in native pixels: dist is the final separation between the fingers (px). dist > 200 — zoom in (spread), dist < 200 — zoom out (squeeze). Requires the bridge control channel (scrcpy) — no adb fallback.',
+    inputSchema: {
+      x: z.number().int().min(0).max(1080), y: z.number().int().min(0).max(2400),
+      dist: z.number().int().min(50).max(2400).optional().describe('Final finger separation, px (default 400 = zoom in)'),
+      ms: z.number().int().min(100).max(5000).optional().describe('Duration, ms (default 500)'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  async ({ x, y, dist, ms }) => {
+    try { await relayWrite({ type: 'pinch', x, y, dist, ms }); return replyText(`pinch at ${x},${y} → dist=${dist ?? 400} over ${ms ?? 500}ms`); }
+    catch (e) { return replyError(e); }
+  },
+);
+
+mcp.registerTool(
+  'set_orientation',
+  {
+    title: 'Lock screen orientation',
+    description: 'Lock the device to portrait or landscape (settings put system user_rotation with accelerometer_rotation off), or restore auto-rotation (lock=false). Affects the whole device, not just the foreground app.',
+    inputSchema: {
+      orientation: z.enum(['portrait', 'landscape']),
+      lock: z.boolean().optional().describe('false = restore auto-rotation (default true = lock to orientation)'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  async ({ orientation, lock = true }) => {
+    try {
+      const serial = await primaryEmuSerial();
+      if (!serial) throw new Error('emulator not found — call env_start');
+      if (!lock) {
+        await adbShell('settings put system accelerometer_rotation 1', 8000);
+        return replyText('auto-rotation restored');
+      }
+      const rot = orientation === 'landscape' ? 1 : 0;
+      await adbShell('settings put system accelerometer_rotation 0', 8000);
+      await adbShell(`settings put system user_rotation ${rot}`, 8000);
+      return replyText(`locked to ${orientation} (user_rotation=${rot})`);
     } catch (e) { return replyError(e); }
   },
 );

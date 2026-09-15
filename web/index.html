@@ -81,6 +81,7 @@
   <button class="nav-btn" data-key="187" title="Recents">
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
   </button>
+  <button class="nav-btn" id="audioBtn" title="Sound (device audio)" style="display:none"></button>
 </div>
 <script>
 const c = document.getElementById('c');
@@ -100,7 +101,7 @@ function applyInputMode(enabled) {
 }
 
 const urlCodec = new URLSearchParams(location.search).get('codec');
-const mode = urlCodec === 'webp' ? 'webp' : (urlCodec === 'h264' || window.VideoDecoder) ? 'h264' : 'webp';
+const mode = urlCodec === 'h264' || window.VideoDecoder ? 'h264' : 'none';
 
 // access token (MCP-managed bridge): page opened via a link of the form /?token=…
 const ACCESS_TOKEN = new URLSearchParams(location.search).get('token') || '';
@@ -160,15 +161,6 @@ function offerFrame(frameObj) {
   scheduleDraw();
 }
 
-// --- WebP path: decoding off the main thread ---
-
-async function handleWebpFrame(u8) {
-  let bmp;
-  try { bmp = await createImageBitmap(new Blob([u8], { type: 'image/webp' })); }
-  catch { return; }
-  offerFrame(bmp);
-}
-
 // --- H.264 path: WebCodecs VideoDecoder ---
 
 let decoder = null, codecStr = '', needKey = true;
@@ -216,14 +208,93 @@ function handleH264Message(u8) {
   }
 }
 
+// --- device audio: opus over the same WS ([0x02] packet / [0x03] OpusHead config) ---
+
+const audioBtn = document.getElementById('audioBtn');
+const AUDIO_ON = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z" fill="#4ade80" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg>';
+const AUDIO_OFF = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#999" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z" fill="#999" stroke="none"/><path d="m16 9 6 6M22 9l-6 6"/></svg>';
+let audioDecoder = null, audioCtx = null, audioNextTime = 0, audioMuted = true, audioReady = false;
+const audioSupported = mode === 'h264' && typeof AudioDecoder !== 'undefined';
+
+function renderAudioBtn() {
+  audioBtn.innerHTML = audioMuted ? AUDIO_OFF : AUDIO_ON;
+  audioBtn.title = audioMuted ? 'Sound off — click to unmute' : 'Sound on — click to mute';
+}
+
+function configureAudio(head) {
+  let sampleRate = 48000, channels = 1;
+  if (head.length >= 16) {
+    channels = head[9];
+    sampleRate = head[12] | (head[13] << 8) | (head[14] << 16) | (head[15] << 24);
+  }
+  if (audioDecoder) { try { audioDecoder.close(); } catch {} }
+  audioDecoder = new AudioDecoder({ output: onAudioData, error: (e) => console.error('audio decoder:', e) });
+  audioDecoder.configure({ codec: 'opus', sampleRate, numberOfChannels: channels, description: head });
+  audioReady = true;
+  audioNextTime = 0;
+}
+
+function onAudioData(audioData) {
+  if (!audioCtx || audioMuted || audioCtx.state !== 'running') { audioData.close(); return; }
+  const frames = audioData.numberOfFrames;
+  const dur = frames / audioData.sampleRate;
+  const now = audioCtx.currentTime;
+  if (audioNextTime < now + 0.02) audioNextTime = now + 0.05;
+  const buf = audioCtx.createBuffer(audioData.numberOfChannels, frames, audioData.sampleRate);
+  for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+    audioData.copyTo(buf.getChannelData(ch), { planeIndex: ch, format: 'f32-planar' });
+  }
+  audioData.close();
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  src.start(audioNextTime);
+  audioNextTime += dur;
+}
+
+function handleAudioMessage(u8) {
+  const data = u8.subarray(1);
+  if (u8[0] === 3) { configureAudio(data); return; }
+  if (u8[0] !== 2 || !audioReady) return;
+  try {
+    audioDecoder.decode(new EncodedAudioChunk({
+      type: 'key',
+      timestamp: Math.round(performance.now() * 1000),
+      data,
+    }));
+  } catch (e) { console.error('audio decode:', e); }
+}
+
+function initAudio() {
+  if (!audioSupported) return;
+  renderAudioBtn();
+  audioBtn.style.display = '';
+  audioBtn.addEventListener('click', () => {
+    audioMuted = !audioMuted;
+    if (!audioMuted) {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      audioCtx.resume().catch(() => {});
+      audioNextTime = 0;
+    }
+    renderAudioBtn();
+  });
+}
+
 function connect() {
-  ws = new WebSocket(`ws://${location.host}/${wsQuery}`);
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${wsProto}//${location.host}/${wsQuery}`);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => ws.send(JSON.stringify({ type: 'init', codec: mode }));
+  if (mode !== 'h264') {
+    document.getElementById('overlay').classList.add('show');
+    document.getElementById('overlay').querySelector('span').textContent =
+      'H.264 not supported — need a modern browser with WebCodecs (Chrome/Edge 94+)';
+  }
   ws.onmessage = (e) => {
     if (e.data instanceof ArrayBuffer) {
       const u8 = new Uint8Array(e.data);
-      if (mode === 'h264') handleH264Message(u8); else handleWebpFrame(u8);
+      if (u8[0] > 1) { if (mode === 'h264') handleAudioMessage(u8); return; }
+      if (mode === 'h264') handleH264Message(u8);
       return;
     }
     try { onWsJson(JSON.parse(e.data)); } catch {}
@@ -253,7 +324,7 @@ function loadResolutions() {
   fetch(withAuth('/resolutions')).then(r => r.json()).then(d => {
     for (const name of d.options) {
       const [w, h] = name.split('x').map(Number);
-      // h264 full-res may be encoded downscaled (srSize); webp — 1004x2231; accept both
+      // full-res (1004x2231) may be encoded downscaled (srSize); accept both
       resMap[name] = { w, h, okW: name === '1004x2231' ? [w, 486, 540, 720, 1004, 1080] : [w] };
     }
     selName = d.current;
@@ -393,6 +464,7 @@ document.addEventListener('fullscreenchange', () => {
 
 connect();
 loadResolutions();
+initAudio();
 </script>
 </body>
 </html>
