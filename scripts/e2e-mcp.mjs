@@ -288,6 +288,85 @@ async function main() {
     check('resource template: shots/{name} (png blob)', !!res2.contents?.[0]?.blob, shotName);
   } catch (e) { check('resource template: shots/{name} (png blob)', false, e.message); }
 
+  // --- auto-restore: video stream survives an emulator crash (ensureDeviceWatch) ---
+  // Only when we own the lifecycle (we booted it ourselves), so we don't kill a pre-running emulator.
+  // Opens a WS client with codec=h264 so the bridge starts a video host; kills the emulator;
+  // the MCP watchdog restarts it; the bridge's ensureDeviceWatch detects boot_completed and
+  // restarts the video host; we verify the stream resumes.
+  if (!emulatorWasRunning) {
+    const info = bridgeInfo();
+    const wsQuery = info?.accessToken ? `?token=${encodeURIComponent(info.accessToken)}` : '';
+    const ws = new WebSocket(`wss://127.0.0.1:${PORT}/${wsQuery}`, { rejectUnauthorized: false });
+    let videoBytes = 0;
+    let firstFrameSeen = false;
+    let keyFrameSeen = false;
+    ws.on('open', () => ws.send(JSON.stringify({ type: 'init', codec: 'h264' })));
+    ws.on('message', (d, isBinary) => {
+      if (!isBinary || d.length < 2) return;
+      videoBytes += d.length;
+      if (!firstFrameSeen) firstFrameSeen = true;
+      if (d[0] & 1) keyFrameSeen = true;
+    });
+    // wait for the first video frame to confirm the stream is flowing
+    const waitStream = (ms) => new Promise((resolve) => {
+      const t0 = Date.now();
+      const poll = setInterval(() => { if (firstFrameSeen || Date.now() - t0 > ms) { clearInterval(poll); resolve(); } }, 200);
+    });
+    await waitStream(15000);
+    const streamBefore = videoBytes;
+    check('auto-restore: video stream flowing before crash', streamBefore > 0, `${streamBefore} bytes received`);
+
+    // kill the emulator via adb emu kill (hard kill, not graceful)
+    const serial = (await adbDevicesRaw()).match(/(emulator-\d+)/)?.[1];
+    if (serial) {
+      await new Promise((resolve) => {
+        import('node:child_process').then(({ execFile }) =>
+          execFile(adbBin(), ['-s', serial, 'emu', 'kill'], { timeout: 15000 }, () => resolve()));
+      });
+      // wait for the device to disappear from adb
+      const t0 = Date.now();
+      while (Date.now() - t0 < 30000) {
+        const devs = await adbDevicesRaw();
+        if (!/emulator-\d+\s+device/.test(devs)) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      check('auto-restore: emulator killed and gone from adb', !/emulator-\d+\s+device/.test(await adbDevicesRaw()));
+
+      // the MCP watchdog (v1.3.2) should restart the emulator; wait for boot
+      // then the bridge's ensureDeviceWatch should restart the video host
+      const t1 = Date.now();
+      let booted = false;
+      while (Date.now() - t1 < 180000) {
+        const devs = await adbDevicesRaw();
+        if (/emulator-\d+\s+device/.test(devs)) {
+          // check boot_completed
+          const bc = await new Promise((resolve) => {
+            import('node:child_process').then(({ execFile }) =>
+              execFile(adbBin(), ['shell', 'getprop', 'sys.boot_completed'], { timeout: 8000 }, (err, stdout) =>
+                resolve(err ? '0' : stdout.trim())));
+          });
+          if (bc === '1') { booted = true; break; }
+        }
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+      check('auto-restore: emulator back and booted (watchdog)', booted, booted ? 'boot_completed=1' : 'timed out waiting for boot');
+
+      // wait for the video stream to resume (ensureDeviceWatch should have restarted the host)
+      if (booted) {
+        await new Promise((r) => setTimeout(r, 5000)); // give the watcher a moment to fire
+        const streamAfter = videoBytes;
+        check('auto-restore: video stream resumed after crash', streamAfter > streamBefore, `before=${streamBefore}B, after=${streamAfter}B (+${streamAfter - streamBefore}B)`);
+      } else {
+        check('auto-restore: video stream resumed after crash', false, 'skipped — emulator did not boot');
+      }
+    } else {
+      check('auto-restore: video stream resumed after crash', false, 'skipped — no emulator serial found');
+    }
+    ws.close();
+  } else {
+    console.log('SKIP auto-restore — the emulator was running before e2e, leaving it as-is');
+  }
+
   // --- adb_restart: adb server restart; the emulator keeps running and must come back ---
   const adbR = await client.callTool({ name: 'adb_restart', arguments: {} });
   const adbRText = (adbR.content || []).map((c) => c.text || '').join('\n');

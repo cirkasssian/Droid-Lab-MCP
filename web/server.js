@@ -346,6 +346,7 @@ const videoHost = makeScrcpyInstance({
   onDied(why) {
     console.log('[scrcpy:video] died:', why);
     videoHost.stop();
+    ensureDeviceWatch();
     if (clientsByCodec('h264').length > 0) {
       const delay = why === 'reverse failed' || why === 'push failed' ? 3000 : 700;
       clearTimeout(videoRespawnTimer);
@@ -453,6 +454,7 @@ const ctrlHost = makeScrcpyInstance({
   onDied(why) {
     console.log('[scrcpy:ctrl] died:', why);
     ctrlHost.stop();
+    ensureDeviceWatch();
     if (clients.size > 0) {
       clearTimeout(ctrlRespawnTimer);
       ctrlRespawnTimer = setTimeout(startCtrlHost, 3000);
