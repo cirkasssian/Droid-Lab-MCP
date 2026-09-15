@@ -273,7 +273,7 @@ A resolution switch does not flicker: the scrcpy video host restarts with the ne
 - **A system image does not boot** — some images are finicky about the host virtualization stack; if one fails to reach `sys.boot_completed`, try another API level (API 33 is a stable default; `emulators.json` carries per-AVD notes).
 - **Native H.264 (1080×2400) is not real-time** with a software-rendered emulator — by design, see [Latency model](#latency-model).
 - **`env_stop` waits up to 25 s** for a graceful emulator exit before a verified kill; SIGKILL mid-shutdown can wedge qemu in kernel D-state and leave stale AVD locks, which `env_start`/`env_stop` clean up themselves.
-- **Emulator killed externally** (e.g. by the OOM killer) — the bridge restores the stream after the emulator is back; restart it manually if needed.
+- **Emulator killed externally** (e.g. by the OOM killer) — the MCP watchdog auto-restarts it with the original arguments (guarded: max 5 restarts per 5 min, then it gives up and logs to `crash.log`), and the browser shows a crash banner until the stream recovers.
 
 ## License
 
