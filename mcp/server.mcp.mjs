@@ -603,7 +603,7 @@ const renderStatus = (s) => {
     lines.push(`${k}: ${v ? `running (pid ${v.pid})` : 'stopped'}`);
   }
   if (s.bridge.up) {
-    lines.push(`bridge: http://${s.bridge.host === '0.0.0.0' ? '<lan-ip>' : s.bridge.host}:${s.bridge.port}, input=${s.bridge.inputEnabled ? 'enabled' : 'disabled'}${s.bridge.controlled ? ' (MCP-controlled)' : ''}, res=${s.bridge.resolution}`);
+    lines.push(`bridge: https://${s.bridge.host === '0.0.0.0' ? '<lan-ip>' : s.bridge.host}:${s.bridge.port}, input=${s.bridge.inputEnabled ? 'enabled' : 'disabled'}${s.bridge.controlled ? ' (MCP-controlled)' : ''}, res=${s.bridge.resolution}`);
   } else {
     lines.push('bridge: down');
   }
@@ -717,7 +717,7 @@ mcp.registerTool(
   {
     title: 'Stop emulator environment',
     description: 'Stop the bridge, the emulator (adb emu kill, then forcibly). Safe shutdown: processes from pidfiles are verified by cmdline; an external emulator (started not via env_start) is left alone if it is not in a pidfile — except adb emu kill, which by definition targets the emulator.',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -793,7 +793,7 @@ mcp.registerTool(
   {
     title: 'Environment status',
     description: 'Environment status: processes (bridge/emulator), the device (boot, Android version, screen, foreground app), input mode, bridge address.',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       summary: z.string(),
@@ -837,7 +837,7 @@ mcp.registerTool(
   {
     title: 'List emulators',
     description: 'Entries of mcp/emulators.json + all AVDs discovered in the SDK (emulator -list-avds).',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       configured: z.array(z.object({ name: z.string(), avd: z.string(), note: z.string().optional() })),
@@ -1070,7 +1070,7 @@ mcp.registerTool(
   {
     title: 'List Android system images',
     description: 'Android system images: installed (from the SDK directory) and available for download (sdkmanager --list).',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       installed: z.array(z.string()),
@@ -1175,7 +1175,7 @@ mcp.registerTool(
   {
     title: 'Device screenshot',
     description: 'Screenshot of the device screen at full resolution (adb screencap PNG, ~1080x2400): the full PNG is saved to shots/, and a downscaled JPEG (~720x1600) is returned in the response. Multiply UI coordinates from the downscaled image by 1.5 for tap/swipe (native pixels). ui_dump is faster for exact element coordinates.',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1325,7 +1325,7 @@ mcp.registerTool(
   {
     title: 'Get device clipboard',
     description: 'Read the device clipboard. Note: scrcpy suppresses re-sending UNCHANGED text — if the buffer has not changed since the last read, the response will not arrive within 5s (a note about it is returned; the control channel may also simply be busy). Parallel calls are serialized.',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1649,7 +1649,7 @@ mcp.registerTool(
   {
     title: 'Dump UI hierarchy',
     description: 'Tree of visible UI elements (uiautomator dump): class, text/content-desc, resource-id, clickable/scrollable, bounds + element center in native pixels — exact coordinates for tap/swipe without guessing from a screenshot. The full XML is saved to shots/uidump-*.xml.',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1721,7 +1721,7 @@ mcp.registerTool(
   {
     title: 'Device state',
     description: 'Full state: process(es), boot, Android/API version, screen, stream resolution, foreground app, input mode.',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       summary: z.string(),
@@ -1772,7 +1772,7 @@ mcp.registerTool(
   {
     title: 'Enable LAN access',
     description: 'Restart the bridge listening on all interfaces (0.0.0.0) and return a URL for the developer: live video + input in the browser (input — after set_dev_input(true)). Access is protected by an access token (generated at bridge start, passed in the URL). The input mode after the restart is reset to "observation".',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1804,7 +1804,7 @@ mcp.registerTool(
   {
     title: 'Disable LAN access',
     description: 'Return the bridge to loopback: access from the developer network is cut off (the stream will break). MCP continues to operate the device.',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1820,7 +1820,7 @@ mcp.registerTool(
   {
     title: 'Restart the bridge',
     description: 'Restart the relay/stream process (web/server.js) WITHOUT touching the emulator: applies bridge code changes and recovers a hung or dead bridge (boots one if none is running). Preserves the host binding (loopback / 0.0.0.0) and the developer-input mode; the access token is regenerated — hand the new URL from the reply to the developer. The browser video stream reconnects on page reload.',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -1905,7 +1905,7 @@ mcp.registerTool(
   {
     title: 'Reboot Android emulator',
     description: 'Reboot the device (adb reboot). App state is preserved (not a cold boot). Waits for boot ~120s (supports cancellation and progress). The bridge and the stream are restored automatically.',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -1939,7 +1939,7 @@ mcp.registerTool(
   {
     title: 'Restart adb server',
     description: 'Restart the local adb server (adb kill-server + adb start-server): helps when adb is wedged — the device disappeared from `adb devices`, is stuck in offline/unauthorized, or port 5037 is held by a stale server. Connections and `adb reverse` tunnels drop for a few seconds; the bridge detects the loss and restarts its streams automatically once the device is back. The emulator, device state and files are NOT affected (this is not a device reboot — see reboot_emulator).',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -2048,7 +2048,7 @@ mcp.registerTool(
   {
     title: 'Collect Android bugreport',
     description: 'Collect a full Android bug report (adb bugreport → zip in shots/): device state, logs, dumpsys for all services. Takes 1–3 minutes. Use for deep diagnostics when logcat/shell are not enough. Returns the local zip path.',
-    inputSchema: z.object({}),
+    inputSchema: z.object({ confirm: z.boolean().optional().describe('Optional, no effect') }),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   async (_, extra) => {
