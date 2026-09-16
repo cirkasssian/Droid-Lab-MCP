@@ -25,10 +25,11 @@
     z-index: 10;
   }
   #fsBtn:hover { background: rgba(0,0,0,.7); }
-  #buttons { display: flex; gap: 16px; padding: 12px; align-items: center; }
+  #buttons { display: flex; gap: 16px; padding: 12px 20px; align-items: center; position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,.4); border-radius: 24px; touch-action: none; }
+  #buttons.dragging { z-index: 100; background: rgba(0,0,0,.7); border-radius: 24px; cursor: grabbing; box-shadow: 0 4px 20px rgba(0,0,0,.5); }
   .nav-btn {
     background: none; border: none; cursor: pointer; padding: 8px;
-    opacity: .6; transition: opacity .15s;
+    opacity: .6; transition: opacity .15s; touch-action: none;
   }
   .nav-btn:hover { opacity: 1; }
   .nav-btn:active { transform: scale(.9); }
@@ -38,10 +39,6 @@
   body.fullscreen canvas { max-width: 100vw; max-height: 100vh; width: 100vw; height: 100vh; object-fit: contain; }
   body.fullscreen #wrap { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
   body.fullscreen #fsBtn { top: 12px; right: 12px; }
-  body.fullscreen #buttons {
-    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
-    background: rgba(0,0,0,.4); border-radius: 24px; padding: 4px 12px;
-  }
   #overlay {
     position: absolute; inset: 0;
     background: #111;
@@ -93,6 +90,9 @@
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
   </button>
   <button class="nav-btn" id="audioBtn" title="Sound (device audio)" style="display:none"></button>
+  <button class="nav-btn" id="dragHandle" title="Drag to move panel">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M2 12h20M12 2l-3 3M12 2l3 3M12 22l-3-3M12 22l3-3M2 12l3-3M2 12l3 3M22 12l-3-3M22 12l-3 3"/></svg>
+  </button>
 </div>
 <script>
 const c = document.getElementById('c');
@@ -479,8 +479,44 @@ document.addEventListener('drop', (e) => {
     .finally(() => setTimeout(() => { fpsEl.textContent = old; }, 4000));
 });
 
-buttons.querySelectorAll('.nav-btn').forEach(btn => {
+buttons.querySelectorAll('.nav-btn[data-key]').forEach(btn => {
   btn.addEventListener('click', () => send({ type: 'key', code: parseInt(btn.dataset.key) }));
+});
+
+// drag-to-move: grab the handle and drag
+const dragHandle = document.getElementById('dragHandle');
+let dragOffX = 0, dragOffY = 0, isDragging = false;
+dragHandle.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  const rect = buttons.getBoundingClientRect();
+  dragOffX = e.clientX - rect.left;
+  dragOffY = e.clientY - rect.top;
+  isDragging = true;
+  buttons.classList.add('dragging');
+  buttons.style.left = rect.left + 'px';
+  buttons.style.top = rect.top + 'px';
+  buttons.style.bottom = 'auto';
+  buttons.style.transform = 'none';
+  dragHandle.setPointerCapture(e.pointerId);
+});
+dragHandle.addEventListener('pointermove', (e) => {
+  if (!isDragging) return;
+  e.preventDefault();
+  const x = Math.max(0, Math.min(window.innerWidth - buttons.offsetWidth, e.clientX - dragOffX));
+  const y = Math.max(0, Math.min(window.innerHeight - buttons.offsetHeight, e.clientY - dragOffY));
+  buttons.style.left = x + 'px';
+  buttons.style.top = y + 'px';
+});
+dragHandle.addEventListener('pointerup', (e) => {
+  if (!isDragging) return;
+  isDragging = false;
+  buttons.classList.remove('dragging');
+  dragHandle.releasePointerCapture(e.pointerId);
+});
+dragHandle.addEventListener('pointercancel', () => {
+  if (!isDragging) return;
+  isDragging = false;
+  buttons.classList.remove('dragging');
 });
 
 fsBtn.addEventListener('click', () => {
