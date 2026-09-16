@@ -789,7 +789,7 @@ const renderStatus = (s) => {
   return lines.join('\n');
 };
 
-const mcp = new McpServer({ name: 'droidlab', version: '1.6.0' });
+const mcp = new McpServer({ name: 'droidlab', version: '1.6.1' });
 
 let startGate = false; // mutex: parallel env_start calls conflict over pidfiles and spawn
 

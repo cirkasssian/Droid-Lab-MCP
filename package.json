@@ -1,6 +1,6 @@
 {
   "name": "droidlab",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "private": true,
   "description": "Android emulator: browser bridge (H.264/WebCodecs) + MCP agent server",
   "license": "MIT",
