@@ -283,10 +283,13 @@ const lookupAvd = (name) => {
 
 const pickDefaultAvd = () => {
   if (PREFERRED_AVD) return lookupAvd(PREFERRED_AVD).avd;
-  const configured = loadConfig().defaultAvd;
-  if (configured) return lookupAvd(configured).avd;
-  const cfg = readEmulatorRegistry();
-  if (cfg.length && cfg[0].avd) return cfg[0].avd;
+  const cfg = loadConfig();
+  // When the user does not specify an AVD: resume the last started one (lastAvd),
+  // otherwise fall back to the configured default (defaultAvd).
+  if (cfg.lastAvd) return lookupAvd(cfg.lastAvd).avd;
+  if (cfg.defaultAvd) return lookupAvd(cfg.defaultAvd).avd;
+  const reg = readEmulatorRegistry();
+  if (reg.length && reg[0].avd) return reg[0].avd;
   throw new Error('AVD not specified: pass avd, set EMU_AVD or mcp_config defaultAvd, or add an entry to the emulator registry');
 };
 
@@ -298,6 +301,7 @@ const CONFIG_DEFAULTS = {
   port: 8090,
   requireToken: true,
   defaultAvd: null,
+  lastAvd: null,
   extraArgs: '',
   bootTimeoutMs: 120000,
   scrcpyVersion: '4.1',
@@ -369,7 +373,7 @@ const bootRelay = async (host) => {
   try { await ensureScrcpyCached(null); } catch (e) { console.error(`[env] scrcpy bootstrap skipped: ${e.message}`); }
   const cfg = loadConfig();
   const port = cfg.port;
-  const token = cfg.requireToken ? crypto.randomBytes(24).toString('hex') : null;
+  const token = crypto.randomBytes(24).toString('hex');
   const accessToken = cfg.requireToken ? crypto.randomBytes(16).toString('hex') : null;
   const child = launchDetached(process.execPath, [path.join(PROJECT_HOME, 'web', 'server.js')], {
     env: {
@@ -785,7 +789,7 @@ const renderStatus = (s) => {
   return lines.join('\n');
 };
 
-const mcp = new McpServer({ name: 'droidlab', version: '1.5.1' });
+const mcp = new McpServer({ name: 'droidlab', version: '1.6.0' });
 
 let startGate = false; // mutex: parallel env_start calls conflict over pidfiles and spawn
 
@@ -798,6 +802,7 @@ mcp.registerTool(
     title: 'Start emulator environment',
     description: 'Start emulator (cold boot, state lost on env_stop) + bridge on loopback. Idempotent; for a different AVD run env_stop first. Browser input disabled until set_dev_input(true). Self-bootstraps missing AVD, cmdline-tools, java, scrcpy (network required). First start ~30-60s.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       avd: z.string().optional().describe('Name from mcp/emulators.json ("android-13") or raw AVD name ("API33"). Default: EMU_AVD env, otherwise the first entry in the config.'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -862,6 +867,8 @@ mcp.registerTool(
         Object.assign(emuInfo, { avd: avdName, args, env: emuEnv, bootLog });
         autoRestartReset();
         watchdogArm();
+        // remember the last started AVD so a bare env_start resumes this configuration
+        saveConfig({ lastAvd: avdName });
       }
 
       let scrcpyWarning = null;
@@ -903,7 +910,7 @@ mcp.registerTool(
   {
     title: 'Stop emulator environment',
     description: 'Stop bridge + emulator (adb emu kill, then forced). External emulators (not via env_start) are left alone.',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -983,7 +990,7 @@ mcp.registerTool(
   {
     title: 'Environment status',
     description: 'Status: processes, device (boot, Android version, screen, foreground app), input mode, bridge address.',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       summary: z.string(),
@@ -1027,7 +1034,7 @@ mcp.registerTool(
   {
     title: 'List emulators',
     description: 'Entries of the emulator registry + all AVDs discovered in the SDK (emulator -list-avds).',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       configured: z.array(z.object({ name: z.string(), avd: z.string(), note: z.string().optional(), device: z.string().optional() })),
@@ -1268,7 +1275,7 @@ mcp.registerTool(
   {
     title: 'List Android system images',
     description: 'System images: installed + available for download (sdkmanager --list).',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       installed: z.array(z.string()),
@@ -1302,6 +1309,7 @@ mcp.registerTool(
     title: 'Download Android system image',
     description: 'Download system image (sdkmanager --install). Package from system_images_list. Licenses auto-accepted. 30-min cap, cancellable, progress.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       package: z.string().regex(IMAGE_PKG_RE, 'system-images;android-N;tag;abi'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -1325,6 +1333,7 @@ mcp.registerTool(
     title: 'Create AVD from system image',
     description: 'Create an AVD from a system image + add entry to the emulator registry. Tag/ABI from the package. Device profile defaults to pixel_7; use list_devices to see options (pixel_tablet, nexus_7, …).',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       name: z.string().regex(/^[\w-]+$/, 'AVD name (letters, digits, _ and -)').describe('Name of the new AVD, e.g. API34'),
       package: z.string().regex(IMAGE_PKG_RE, 'system-images;android-N;tag;abi').describe('An installed image from system_images_list'),
       device: z.string().optional().describe('Device profile (default pixel_7). See list_devices for options: pixel_tablet, nexus_7, generic_tablet_768dpi, …'),
@@ -1384,7 +1393,7 @@ mcp.registerTool(
   {
     title: 'List available device profiles',
     description: 'Device profiles usable with avd_create (pixel_7, pixel_tablet, nexus_7, …). Run avdmanager list device.',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     outputSchema: { devices: z.array(z.object({ id: z.string(), name: z.string() })) },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -1420,7 +1429,7 @@ mcp.registerTool(
   {
     title: 'Device screenshot',
     description: 'Full-res screenshot (PNG → shots/, downscaled JPEG inline). Multiply image coords by 1.5 for tap/swipe (native px). ui_dump is faster for exact coordinates.',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1478,6 +1487,7 @@ mcp.registerTool(
     title: 'Tap device screen',
     description: 'Tap on the device screen in NATIVE pixels (screen 1080x2400).',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       x: z.number().int().min(0).max(1080).describe('X in native pixels'),
       y: z.number().int().min(0).max(2400).describe('Y in native pixels'),
     },
@@ -1495,6 +1505,7 @@ mcp.registerTool(
     title: 'Swipe on device screen',
     description: 'Swipe from point to point in native pixels. Long press = swipe(x,y,x,y,ms=800).',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       x1: z.number().int().min(0).max(1080), y1: z.number().int().min(0).max(2400),
       x2: z.number().int().min(0).max(1080), y2: z.number().int().min(0).max(2400),
       ms: z.number().int().min(50).max(10000).optional().describe('Duration, ms (default 300)'),
@@ -1513,6 +1524,7 @@ mcp.registerTool(
     title: 'Scroll on device screen',
     description: 'Scroll at a point: dy > 0 — down, dy < 0 — up (number of "clicks").',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       x: z.number().int().min(0).max(1080), y: z.number().int().min(0).max(2400),
       dy: z.number().int().optional(),
     },
@@ -1530,6 +1542,7 @@ mcp.registerTool(
     title: 'Press device key',
     description: `Press a key: a name (${Object.keys(KEYCODE_TABLE).join(', ')}) or a numeric Android keycode.`,
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       key: z.union([z.string(), z.number()]).describe('Key name or keycode'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -1549,6 +1562,7 @@ mcp.registerTool(
     title: 'Type text on device',
     description: 'Type text into focused field (Unicode/Cyrillic via ADBKeyBoard). Long strings auto-split.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       text: z.string().min(1).max(5000),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -1570,7 +1584,7 @@ mcp.registerTool(
   {
     title: 'Get device clipboard',
     description: 'Read the device clipboard. Scrcpy suppresses unchanged text — no response within 5s if buffer is unchanged. Parallel calls serialized.',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1602,6 +1616,7 @@ mcp.registerTool(
     title: 'Set device clipboard',
     description: 'Write text to clipboard; paste=true also pastes into focused field (repeat with paste duplicates — not idempotent).',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       text: z.string(),
       paste: z.boolean().optional(),
     },
@@ -1619,6 +1634,7 @@ mcp.registerTool(
     title: 'Install APK',
     description: 'Install APK (adb install -r -t). Path is on the emulator machine. Cancellable, may take minutes.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       path: z.string().describe('Absolute or relative path to the .apk'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -1641,6 +1657,7 @@ mcp.registerTool(
     title: 'Push file to device',
     description: 'Copy file to device (adb push). Cancellable.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       src: z.string().describe('Path on the machine with the emulator'),
       dst: z.string().describe('Path on the device, e.g. /sdcard/Download/'),
     },
@@ -1663,6 +1680,7 @@ mcp.registerTool(
     title: 'Launch app by package',
     description: 'Launch app by package (monkey → LAUNCHER intent), e.g. com.android.settings.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       package: z.string().regex(/^[\w.]+$/, 'package name'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -1684,6 +1702,7 @@ mcp.registerTool(
     title: 'Open deep link / URI',
     description: 'Open URI (VIEW intent): https, app links, custom schemes. Optional package force-selects handler.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       uri: z.string().regex(/^[a-zA-Z][a-zA-Z0-9+.-]*:[^\s'"]+$/, 'URI with a scheme, no spaces or quotes').describe('E.g. https://example.com/path or myapp://screen/Detail'),
       package: z.string().regex(/^[\w.]+$/, 'package name').optional().describe('Launch in a specific app'),
     },
@@ -1709,6 +1728,7 @@ mcp.registerTool(
     title: 'List installed apps',
     description: 'Installed packages (default: third-party; system=true includes system). filter = case-insensitive substring. Package names for open_app/close_app.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       system: z.boolean().optional().describe('true — also show system packages'),
       filter: z.string().min(2).optional().describe('Substring of the package name (case-insensitive)'),
     },
@@ -1732,6 +1752,7 @@ mcp.registerTool(
     title: 'Force-stop app',
     description: 'Force-stop app (am force-stop), works even for hung apps. Package from app_list.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       package: z.string().regex(/^[\w.]+$/, 'package name'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -1752,6 +1773,7 @@ mcp.registerTool(
     title: 'Grant/revoke app permission',
     description: 'Grant/revoke runtime permission (pm grant/revoke). Only dangerous permissions declared in the manifest.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       package: z.string().regex(/^[\w.]+$/, 'package name'),
       permission: z.string().regex(/^[\w.]+$/, 'e.g. android.permission.CAMERA'),
       grant: z.boolean().describe('true — grant, false — revoke'),
@@ -1778,6 +1800,7 @@ mcp.registerTool(
     title: 'Pull file from device',
     description: 'Download file from device (adb pull). Default dst: pulled/<basename> in project root. Cancellable.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       src: z.string().min(1).describe('Path on the device, e.g. /sdcard/Download/report.txt'),
       dst: z.string().optional().describe('Local file or directory (default pulled/<basename>)'),
     },
@@ -1803,6 +1826,7 @@ mcp.registerTool(
     title: 'Read device log',
     description: 'Device log snapshot (logcat -d, not a stream). Last N lines, optional filter-spec and substring filter (case-insensitive).',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       lines: z.number().int().min(1).max(2000).optional().describe('The last N lines (default 200)'),
       filter: z.string().regex(/^[\w./*: ,_-]+$/, 'filter-spec without quotes').optional().describe('logcat filter-spec, e.g. "ActivityManager:I *:S"'),
       grep: z.string().optional().describe('Substring for line selection (case-insensitive)'),
@@ -1894,7 +1918,7 @@ mcp.registerTool(
   {
     title: 'Dump UI hierarchy',
     description: 'UI element tree (uiautomator dump): class, text, desc, resource-id, clickable/scrollable, center(x,y) in native px for tap. Full XML saved to shots/.',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -1919,6 +1943,7 @@ mcp.registerTool(
     title: 'Wait for UI element',
     description: 'Poll the UI tree server-side until an element appears. Criteria: text/rid/desc substrings (case-insensitive, AND). Returns center(x,y) ready for tap. Replaces dozens of ui_dump+sleep calls.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       text: z.string().min(1).optional().describe('Substring in the element text'),
       rid: z.string().min(1).optional().describe('Substring in resource-id'),
       desc: z.string().min(1).optional().describe('Substring in content-desc'),
@@ -1966,7 +1991,7 @@ mcp.registerTool(
   {
     title: 'Device state',
     description: 'Full state: processes, boot, Android/API version, screen, resolution, foreground app, input mode.',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     outputSchema: {
       summary: z.string(),
@@ -2017,7 +2042,7 @@ mcp.registerTool(
   {
     title: 'Enable LAN access',
     description: 'Bridge → 0.0.0.0; returns a tokenized LAN URL for live video + input. Input mode resets to observation; enable with set_dev_input(true).',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -2034,10 +2059,13 @@ mcp.registerTool(
           if (i.family === 'IPv4' && !i.internal) urls.push(`https://${i.address}:${effectivePort()}/${accessToken ? `?token=${accessToken}` : ''}`);
         }
       }
+      const authNote = accessToken
+        ? 'HTTP and WS require an access token (it is already in the URL). The input control-mode token is separate and does not end up in the URL.'
+        : 'No access token required (requireToken=false) — the bridge is open on the LAN.';
       return replyText([
         'Access enabled. Open it in the developer browser:',
         ...(urls.length ? urls.map((u) => `- ${u}`) : ['- (LAN IPv4 not found — check the network)']),
-        'HTTP and WS require an access token (it is already in the URL). The input control-mode token is separate and does not end up in the URL.',
+        authNote,
         'Browser input is disabled — allow it: set_dev_input(true).',
       ].join('\n'));
     } catch (e) { return replyError(e); }
@@ -2049,7 +2077,7 @@ mcp.registerTool(
   {
     title: 'Disable LAN access',
     description: 'Bridge → loopback; LAN access cut off. MCP continues to operate the device.',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
@@ -2065,7 +2093,7 @@ mcp.registerTool(
   {
     title: 'Restart the bridge',
     description: 'Restart the bridge (web/server.js) without touching the emulator. Applies code changes, recovers a hung/dead bridge. Preserves host binding and input mode; access token regenerates (new URL in reply).',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -2090,9 +2118,10 @@ mcp.registerTool(
           }
         }
       }
+      const urlLabel = accessToken ? 'New developer URL (token regenerated):' : 'Developer URL:';
       return replyText([
         `Bridge restarted (pid ${fetchPid('bridge')}), listening on ${state.host}:${effectivePort()}.`,
-        ...(urls.length ? ['New developer URL (token regenerated):', ...urls.map((u) => `- ${u}`)] : []),
+        ...(urls.length ? [urlLabel, ...urls.map((u) => `- ${u}`)] : []),
         inputNote,
       ].join('\n'));
     } catch (e) { return replyError(e); }
@@ -2105,6 +2134,7 @@ mcp.registerTool(
     title: 'Change stream resolution',
     description: 'Change stream resolution (324x720, 486x1080, 1004x2231). 1004x2231 is manual-only (ABR may downgrade). list=true shows options.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       name: z.string().optional().describe('Resolution: 324x720 | 486x1080 | 1004x2231. Optional — if not set, the list is shown.'),
       list: z.boolean().optional().describe('true — show the list of available and the current resolution'),
     },
@@ -2149,7 +2179,7 @@ mcp.registerTool(
   {
     title: 'Reboot Android emulator',
     description: 'Reboot device (adb reboot). App state preserved. Waits ~120s for boot. Stream auto-restores.',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -2183,7 +2213,7 @@ mcp.registerTool(
   {
     title: 'Restart adb server',
     description: 'Restart the adb server (kill-server + start-server). For wedged adb: device gone, offline/unauthorized, stale port 5037. Streams auto-recover. NOT a device reboot — see reboot_emulator.',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   async (_, extra) => {
@@ -2221,6 +2251,7 @@ mcp.registerTool(
     title: 'Grant/revoke developer input',
     description: 'Allow (true) or disallow (false) browser input. Requires MCP-controlled bridge (token). "Let me poke" → true; "give it back" → false.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       enabled: z.boolean(),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -2245,6 +2276,7 @@ mcp.registerTool(
     title: 'Run adb shell command',
     description: 'Raw adb shell (dumpsys, getprop, settings, pm, ps, netstat, screenrecord). Prefer dedicated tools when they cover the task.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       cmd: z.string().min(1).max(2000).describe('Shell command, e.g. "dumpsys battery"'),
       timeout: z.number().int().min(1000).max(120000).optional().describe('Timeout, ms (default 20000)'),
     },
@@ -2272,6 +2304,7 @@ mcp.registerTool(
     title: 'Run emulator console command',
     description: 'Emulator console (adb emu): battery, network throttle, GSM call/SMS, GPS, rotate. Requires running emulator.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       cmd: z.string().min(1).max(500).describe('Console command, e.g. "power capacity 50"'),
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
@@ -2293,7 +2326,7 @@ mcp.registerTool(
   {
     title: 'Collect Android bugreport',
     description: 'Full Android bugreport → zip in shots/ (1-3 min). For deep diagnostics when logcat/shell are not enough.',
-    inputSchema: z.object({ confirm: z.boolean().describe('Required, no effect') }),
+    inputSchema: { confirm: z.boolean().describe('Required, no effect') },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   async (_, extra) => {
@@ -2317,6 +2350,7 @@ mcp.registerTool(
     title: 'Uninstall an app',
     description: 'Uninstall a third-party app (adb uninstall). System apps cannot be removed.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       package: z.string().regex(/^[\w.]+$/, 'package name like com.example.app'),
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -2338,6 +2372,7 @@ mcp.registerTool(
     title: 'Clear app data',
     description: 'Reset app to first-launch state (pm clear): wipes data, cache, logins, runtime permissions.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       package: z.string().regex(/^[\w.]+$/, 'package name like com.example.app'),
     },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -2359,6 +2394,7 @@ mcp.registerTool(
     title: 'Read host-side logs',
     description: 'Tail host-side logs: file="bridge" (relay/stream), "emulator" (qemu), "mcp" (this server). For on-device logs use logcat.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       file: z.enum(['bridge', 'emulator', 'mcp']).optional().describe('Which log to read (default bridge)'),
       lines: z.number().int().min(1).max(400).optional().describe('Last N lines (default 80)'),
     },
@@ -2382,6 +2418,7 @@ mcp.registerTool(
     title: 'Pinch-zoom gesture (two fingers)',
     description: 'Two-finger pinch at a point (native px). dist = final finger separation: >200 zoom in, <200 zoom out. Scrcpy control channel only, no adb fallback.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       x: z.number().int().min(0).max(1080), y: z.number().int().min(0).max(2400),
       dist: z.number().int().min(50).max(2400).optional().describe('Final finger separation, px (default 400 = zoom in)'),
       ms: z.number().int().min(100).max(5000).optional().describe('Duration, ms (default 500)'),
@@ -2400,6 +2437,7 @@ mcp.registerTool(
     title: 'Lock screen orientation',
     description: 'Lock portrait/landscape or restore auto-rotation (lock=false). Affects whole device.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       orientation: z.enum(['portrait', 'landscape']),
       lock: z.boolean().optional().describe('false = restore auto-rotation (default true = lock to orientation)'),
     },
@@ -2427,14 +2465,16 @@ mcp.registerTool(
   'mcp_config',
   {
     title: 'Get/set MCP configuration',
-    description: 'Read/update persisted config (state dir/config.json). Options: port, requireToken, defaultAvd, extraArgs, bootTimeoutMs, scrcpyVersion, inputEnabled. {show:true} reads; pass keys to update; {reset:true} restores defaults; {defaults:true} confirms defaults. Changes apply on next bridge restart.',
+    description: 'Read/update persisted config (state dir/config.json). Options: port, requireToken, defaultAvd, lastAvd, extraArgs, bootTimeoutMs, scrcpyVersion, inputEnabled. {show:true} reads; pass keys to update; {reset:true} restores defaults; {defaults:true} confirms defaults. Changes apply on next bridge restart.',
     inputSchema: {
+      confirm: z.boolean().describe('Required, no effect — prevents JSON truncation'),
       show: z.boolean().optional().describe('true — return the current configuration'),
       reset: z.boolean().optional().describe('true — restore built-in defaults and delete config.json'),
       defaults: z.boolean().optional().describe('true — persist the current defaults (marks config as user-confirmed)'),
       port: z.number().int().min(1).max(65535).optional().describe('Bridge listen port (default 8090)'),
       requireToken: z.boolean().optional().describe('Require an access token for HTTP/WS (default true)'),
-      defaultAvd: z.string().nullable().optional().describe('Preferred AVD name (default null = first in emulators.json)'),
+      defaultAvd: z.string().nullable().optional().describe('Fallback AVD when no lastAvd is set (default null = first in emulators.json)'),
+      lastAvd: z.string().nullable().optional().describe('Last started AVD — auto-updated by env_start; a bare env_start resumes it, taking priority over defaultAvd (default null)'),
       extraArgs: z.string().optional().describe('Extra emulator arguments (default "")'),
       bootTimeoutMs: z.number().int().min(5000).max(600000).optional().describe('Boot wait limit in ms (default 120000)'),
       scrcpyVersion: z.string().optional().describe('scrcpy release to download (default "4.1")'),
@@ -2446,6 +2486,7 @@ mcp.registerTool(
         port: z.number(),
         requireToken: z.boolean(),
         defaultAvd: z.string().nullable(),
+        lastAvd: z.string().nullable(),
         extraArgs: z.string(),
         bootTimeoutMs: z.number(),
         scrcpyVersion: z.string(),

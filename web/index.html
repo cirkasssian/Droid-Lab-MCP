@@ -17,6 +17,7 @@
   #inputBadge.on { display: inline; }
   #wrap { position: relative; }
   canvas { max-width: 95vw; max-height: 78vh; box-shadow: 0 0 40px #000; cursor: crosshair; touch-action: none; }
+  canvas.hidden { display: none; }
   #fsBtn {
     position: absolute; top: 8px; right: 8px;
     background: rgba(0,0,0,.5); color: #fff; border: 1px solid #555;
@@ -63,6 +64,7 @@
     animation: spin .8s linear infinite;
   }
   #fps { font-variant-numeric: tabular-nums; opacity: .7; font-size: 13px; min-width: 52px; text-align: right; }
+  #bitrate { font-variant-numeric: tabular-nums; opacity: .7; font-size: 13px; min-width: 72px; text-align: right; }
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
@@ -70,12 +72,13 @@
 <header>
   <span id="ver">Android …</span>
   <span id="inputBadge" title="Input disabled — agent is controlling the device">👁 observation only</span>
-  <span id="resBadge" title="Resolution is adjusted automatically to network bandwidth">auto …</span>
+  <span id="resBadge" title="Resolution is adjusted automatically to network bandwidth" style="display:none"></span>
   <span id="fps">— fps</span>
+  <span id="bitrate">—</span>
 </header>
 <div id="crashBanner"></div>
 <div id="wrap">
-  <canvas id="c" width="486" height="1080"></canvas>
+  <canvas id="c" class="hidden" width="486" height="1080"></canvas>
   <button id="fsBtn" title="Fullscreen">⛶</button>
   <div id="overlay"><div class="spinner"></div><span>Switching resolution…</span></div>
 </div>
@@ -98,6 +101,7 @@ const buttons = document.getElementById('buttons');
 const fsBtn = document.getElementById('fsBtn');
 const verEl = document.getElementById('ver');
 const fpsEl = document.getElementById('fps');
+const bitrateEl = document.getElementById('bitrate');
 let ws, frames = 0, switching = false, targetW = 0, targetH = 0, selName = '';
 const resMap = {};
 let devInput = true;
@@ -357,8 +361,14 @@ fetch(withAuth('/state')).then(r => r.json()).then(d => {
   if (d.screenWidth && d.screenHeight) {
     SCREEN_W = d.screenWidth;
     SCREEN_H = d.screenHeight;
+    // size the canvas to the real device aspect before the first video frame,
+    // so the placeholder silhouette matches the actual device (tablet/phone)
+    const scale = Math.min(1080 / SCREEN_W, 2400 / SCREEN_H, 1);
+    c.width = Math.round(SCREEN_W * scale);
+    c.height = Math.round(SCREEN_H * scale);
   }
-}).catch(() => {});
+  c.classList.remove('hidden');
+}).catch(() => { c.classList.remove('hidden'); });
 
 function send(obj) {
   if (!devInput) return;
@@ -432,6 +442,10 @@ function onWsJson(d) {
   if (d.type === 'input-mode') applyInputMode(!!d.enabled);
   if (d.type === 'clip' && d.text) {
     navigator.clipboard.writeText(d.text).catch(() => {});
+  }
+  if (d.type === 'bitrate') {
+    const kb = d.kbps / 8;
+    bitrateEl.textContent = kb >= 1024 ? (kb / 1024).toFixed(1) + ' MB/s' : Math.round(kb) + ' KB/s';
   }
   if (d.type === 'crash') showCrash(d);
 }

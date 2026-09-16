@@ -95,8 +95,13 @@ function clientsByCodec(codec) {
   return out;
 }
 
+function trackSend(ws, msg) {
+  ws.bytesSent += (msg && msg.length) || 0;
+  ws.send(msg);
+}
+
 function broadcastH264(msg) {
-  for (const ws of clientsByCodec('h264')) ws.send(msg);
+  for (const ws of clientsByCodec('h264')) trackSend(ws, msg);
 }
 
 function broadcastCrash(info) {
@@ -423,7 +428,7 @@ let audioBuf = Buffer.alloc(0);
 let audioHandshaked = false;
 
 function broadcastAudio(msg) {
-  for (const ws of clientsByCodec('h264')) ws.send(msg);
+  for (const ws of clientsByCodec('h264')) trackSend(ws, msg);
 }
 
 function parseAudioStream(chunk) {
@@ -792,6 +797,23 @@ setInterval(() => {
   for (const ws of clients) if (ws.readyState === 1) ws.ping(PING_TS);
 }, 1000);
 
+// bitrate telemetry: per-client bytes sent over the last second, broadcast as JSON
+setInterval(() => {
+  const now = Date.now();
+  const active = [...clients].filter((ws) => ws.readyState === 1 && ws.codec === 'h264');
+  if (active.length === 0) return;
+  const rates = active.map((ws) => {
+    const dt = (now - ws.lastBytesTs) / 1000;
+    const kbps = dt > 0 ? Math.round(ws.bytesSent * 8 / 1000 / dt) : 0;
+    ws.bytesSent = 0;
+    ws.lastBytesTs = now;
+    return kbps;
+  });
+  const kbps = Math.max(...rates);
+  const msg = JSON.stringify({ type: 'bitrate', kbps });
+  for (const ws of clients) if (ws.readyState === 1) ws.send(msg);
+}, 1000);
+
 async function handleInputMsg(ws, d) {
   try {
     if (!(ws && ws.isController) && !devInputEnabled) return; // observation mode: input is dropped
@@ -1040,6 +1062,8 @@ wss.on('connection', (ws) => {
   ws.codec = 'none';
   ws.rttMin = Infinity;
   ws.rttSlow = 0;
+  ws.bytesSent = 0;
+  ws.lastBytesTs = Date.now();
   ws.on('pong', (data) => {
     if (data && data.length === 8) abrOnPong(ws, Date.now() - Number(data.readBigUInt64BE(0)));
   });
@@ -1060,14 +1084,14 @@ wss.on('connection', (ws) => {
           // keyframe; if the cache is stale — we restart the host for a fresh IDR
           const fresh = lastKeyAU && Date.now() - lastKeyAU.ts < 1500;
           if (fresh) {
-            ws.send(lastKeyAU.msg);
+            trackSend(ws, lastKeyAU.msg);
           }
           if (!videoHost.running() || !fresh) startVideoHost();
           setTimeout(() => { if (clients.size > 0 && !ctrlHost.running()) startCtrlHost(); }, 600);
         } else {
           const fresh = lastKeyAU && Date.now() - lastKeyAU.ts < 1500;
           if (fresh) {
-            ws.send(lastKeyAU.msg);
+            trackSend(ws, lastKeyAU.msg);
           } else {
             startScreenrecord();
           }

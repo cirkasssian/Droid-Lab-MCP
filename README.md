@@ -188,7 +188,7 @@ ssh -L 8090:localhost:8090 user@headless -N
 # then: https://localhost:8090/?token=<accessToken> (localhost is a secure context — no cert warning)
 ```
 
-Browser controls: click = tap, drag = swipe, wheel = scroll, keyboard = device input (printable text, Backspace, Enter, arrows, Esc), plus Back / Home / Recents / fullscreen buttons and a sound toggle (device audio is streamed as opus; the browser starts muted — autoplay policy). APKs can be dragged into the window (`adb install -r -t`); other dropped files land in `/sdcard/Download/`. Ctrl+C / Ctrl+V bridge the host clipboard with the device. Touch coordinates are mapped to the device's native screen size (queried via `wm size`), so tablets and phones both work correctly.
+Browser controls: click = tap, drag = swipe, wheel = scroll, keyboard = device input (printable text, Backspace, Enter, arrows, Esc), plus Back / Home / Recents / fullscreen buttons and a sound toggle (device audio is streamed as opus; the browser starts muted — autoplay policy). APKs can be dragged into the window (`adb install -r -t`); other dropped files land in `/sdcard/Download/`. Ctrl+C / Ctrl+V bridge the host clipboard with the device. Touch coordinates are mapped to the device's native screen size (queried via `wm size`), so tablets and phones both work correctly. The header shows FPS and the actual downlink bitrate (KB/s or MB/s, max across active h264 clients, updated 1×/sec). The canvas is hidden until the device's real aspect ratio is known (via `/state`), so the placeholder silhouette matches the actual device (tablet/phone).
 
 ## Architecture
 
@@ -266,7 +266,7 @@ Input commands:
 {"type":"text","text":"hello"}
 ```
 
-Server → client: binary frames `[1 byte flag][payload]` (bit 0 = keyframe for H.264 AUs, Annex-B; flag `0x02` = opus audio packet, `0x03` = OpusHead config — both raw from the device, 48 kHz stereo), `{"type":"res","name":"486x1080"}` on resolution changes, and a 1 Hz ping (RTT probe for ABR).
+Server → client: binary frames `[1 byte flag][payload]` (bit 0 = keyframe for H.264 AUs, Annex-B; flag `0x02` = opus audio packet, `0x03` = OpusHead config — both raw from the device, 48 kHz stereo), `{"type":"res","name":"486x1080"}` on resolution changes, `{"type":"bitrate","kbps":N}` every second (actual downlink bitrate, max across active h264 clients), and a 1 Hz ping (RTT probe for ABR).
 
 ## Latency model
 
